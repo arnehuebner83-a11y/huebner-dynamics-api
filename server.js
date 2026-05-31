@@ -8,60 +8,78 @@ app.use(express.json({ limit: '50mb' }));
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+const MODEL = 'claude-sonnet-4-6';
+const BUILD = '2026-05-31-1';
+
+// Health-/Versions-Check: einfach https://huebner-dynamics-api.onrender.com/ im Browser oeffnen.
+// Zeigt, welches Modell und welcher Build gerade LIVE laufen.
+app.get('/', (req, res) => {
+  res.json({ ok: true, service: 'huebner-dynamics-api', model: MODEL, build: BUILD });
+});
+
 app.post('/api/scan-fahrzeugschein', async (req, res) => {
   try {
     const { b64 } = req.body;
     if (!b64) throw new Error('Kein Bild vorhanden');
 
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 600,
+      model: MODEL,
+      max_tokens: 1500,
       messages: [{
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
-          { type: 'text', text: `Du bist Experte für deutsche Zulassungsbescheinigungen Teil I (Fahrzeugscheine). Lies das Bild SEHR GENAU.
+          { type: 'text', text: `Du bist Experte für deutsche Zulassungsbescheinigungen Teil I (Fahrzeugscheine). Lies das Bild SEHR GENAU, Zeichen für Zeichen.
 
-WICHTIG - Layout des Fahrzeugscheins:
-- OBEN LINKS steht "Zulassungsbescheinigung Teil I" und darunter eine Nr. wie "HP-K-1-035/25-00024" (das ist NICHT das Kennzeichen!)
-- Das KENNZEICHEN steht im Feld A "Amtliches Kennzeichen", meist in einem Kasten, Format wie "KH M789" oder "M-AB 1234"
-- GANZ OBEN in der mittleren Spalte: Datum (Feld B, z.B. 30.09.2016), direkt rechts daneben kleine Zahl "2.1" mit 4 Ziffern (HSN), dann "2.2" mit Code (TSN)
+SO IST DAS FORMULAR AUFGEBAUT:
+- Die Nummer OBEN LINKS (z.B. "HP-K-1-035/25-00024") ist NICHT das Kennzeichen.
+- KENNZEICHEN (Feld A, "Amtliches Kennzeichen"): steht LINKS in einem eigenen Kasten, größer gedruckt. Format: 1-3 Buchstaben + Leerzeichen + 1-2 Buchstaben + 1-4 Ziffern, z.B. "KH M789".
+- HSN (Feld 2.1) und TSN (Feld 2.2) stehen in der ALLEROBERSTEN Zeile des Datenblocks, direkt RECHTS neben dem Erstzulassungs-Datum (Feld B).
+  - HSN (2.1): GENAU 4 Ziffern, z.B. "0005".
+  - TSN (2.2): alphanumerischer Code direkt rechts daneben, z.B. "BVZ00047X".
+- ACHTUNG, häufiger Fehler: In der MITTE des Formulars (unter dem Hersteller) stehen weitere kurze Codes und Zahlenblöcke (Genehmigungs-/Achsdaten o.ä.). Diese sind NICHT HSN, NICHT TSN und NICHT das Modell. HSN und TSN kommen AUSSCHLIESSLICH aus der obersten Zeile neben Feld B.
+- FIN (Feld E): genau 17 Zeichen.
+- HERSTELLER (Feld D.1): z.B. "BMW".
+- MODELL (Feld D.3, Handelsbezeichnung): die längere Typbezeichnung wie "430d" oder "318ti" - KEIN kurzer 2-Zeichen-Code.
+- HALTER: Feld C.1.1 (Name) + C.1.2 (Vorname) zusammen, z.B. "Gräfin zu Münster Astrid".
+- ERSTZULASSUNG (Feld B): Datum TT.MM.JJJJ.
 
-EXTRAHIERE (lies jeden Wert ZEICHEN FÜR ZEICHEN):
-
-1. kennzeichen: Feld A, amtliches Kennzeichen (z.B. "KH M789"). NICHT die Nr oben links!
-2. fin: Feld E, exakt 17 Zeichen (Fahrgestellnummer/VIN)
-3. hsn: Feld 2.1, GENAU 4 Ziffern (Herstellerschlüsselnummer, z.B. "0005")
-4. tsn: Feld 2.2, der Code rechts neben 2.1 (z.B. "BVZ00047X" oder "AE 123")
-5. hersteller: Feld D.1 (z.B. "BMW") oder Feld 2/Hersteller-Klartext (z.B. "BAYER.MOT.WERKE-BMW")
-6. modell: Feld D.3 (Handelsbezeichnung, z.B. "430D")
-7. halter: Feld C.1.1 (Name) + C.1.2 (Vorname), zusammen (z.B. "Gräfin zu Münster Astrid")
-8. erstzulassung: Feld B, Datum erste Zulassung (TT.MM.JJJJ)
+VORGEHEN (wichtig, in dieser Reihenfolge):
+1. Transkribiere zuerst wörtlich die oberste Zeile: das Datum aus Feld B, dann den Wert bei 2.1, dann den Wert bei 2.2.
+2. Lies das Kennzeichen aus dem großen Kasten links (Feld A).
+3. Gib danach GENAU EIN JSON-Objekt aus.
 
 REGELN:
-- Lies NUR was wirklich dasteht, errate NICHTS
-- HSN = immer exakt 4 Ziffern
-- Wenn ein Feld nicht sicher lesbar: leerer String ""
+- Lies NUR, was wirklich dasteht - errate nichts.
+- Wenn ein Feld nicht sicher lesbar ist: leerer String "".
+- HSN immer genau 4 Ziffern.
 
-Antworte NUR mit JSON:
+Format (eine kurze Transkription davor ist erlaubt, danach GENAU EIN JSON-Objekt):
 {"kennzeichen":"","fin":"","hsn":"","tsn":"","hersteller":"","modell":"","halter":"","erstzulassung":""}` },
         ],
       }],
     });
 
-    const raw = response.content[0]?.text || '{}';
-    let p;
-    try { p = JSON.parse(raw.replace(/```json|```/g, '').trim()); } catch (e) { p = {}; }
+    const raw = response.content?.[0]?.text || '';
+    let p = {};
+    try {
+      const m = raw.match(/\{[\s\S]*\}/);
+      p = m ? JSON.parse(m[0]) : {};
+    } catch (e) {
+      p = {};
+    }
 
     const fin = (p.fin || '').toUpperCase().replace(/[^A-HJ-NPR-Z0-9]/g, '').slice(0, 17);
     const hsn = (p.hsn || '').replace(/[^0-9]/g, '').slice(0, 4);
 
     res.json({
       success: true,
+      model: MODEL,
+      build: BUILD,
       kennzeichen: (p.kennzeichen || '').trim(),
       fin: fin.length === 17 ? fin : '',
       hsn,
-      tsn: (p.tsn || '').trim().slice(0, 10),
+      tsn: (p.tsn || '').trim().slice(0, 12),
       hersteller: (p.hersteller || '').trim(),
       modell: (p.modell || '').trim(),
       halter: (p.halter || '').trim(),
@@ -73,4 +91,4 @@ Antworte NUR mit JSON:
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`Backend (${MODEL}, build ${BUILD}) läuft auf Port ${PORT}`));
