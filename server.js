@@ -1,6 +1,7 @@
 import express from 'express';
 import Anthropic from '@anthropic-ai/sdk';
 import cors from 'cors';
+import papierkram from './papierkram.js';
 
 const app = express();
 app.use(cors());
