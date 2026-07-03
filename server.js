@@ -5,7 +5,7 @@ import cors from 'cors';
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-
+app.use(papierkram);
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const MODEL = 'claude-sonnet-4-6';
