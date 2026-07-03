@@ -1,17 +1,18 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 2 — Pfade & Felder an die echte API angepasst (aus /inspect + Doku):
-//   • Kunden = "Unternehmen"-Kontakte unter /contact/companies (auch Privatkunden)
-//   • Rechnung: name (=Kennzeichen), document_date, supply_date (Freitext,
-//     deutsches Format = Leistungszeitraum), line_items, customer
+// Version 3 — POST-Format verifiziert (payment_term Pflicht & verschachtelt,
+// customer verschachtelt, line_items mit Name/Menge/Einheit/Preis/MwSt).
 //
-// EINBINDEN (hast du schon): import papierkram from './papierkram.js';
-//                            app.use(papierkram);
+// EINBINDEN (unverändert): import papierkram from './papierkram.js';
+//                          app.use(papierkram);
 //
 // Render → Environment:
 //     PAPIERKRAM_TOKEN              = <Token>
 //     PAPIERKRAM_SUBDOMAIN          = hbnerdynamics
-//     PAPIERKRAM_LABOR_ID           = 3        ← "Arbeitsstunde" (98 €/h), empfohlen!
+//     PAPIERKRAM_LABOR_ID           = 3          ← "Arbeitsstunde" (empfohlen)
+//     PAPIERKRAM_PAYMENT_TERM_ID    = (optional) feste Zahlungsbedingung;
+//                                     sonst wird automatisch die erste genommen
+//     PAPIERKRAM_VAT                = (optional) MwSt-Satz, Default "19%"
 //     PAPIERKRAM_AUTOCREATE_CONTACT = (optional) "false" = neue Kunden nicht anlegen
 // ============================================================================
 
@@ -22,6 +23,8 @@ const router = express.Router();
 const TOKEN = process.env.PAPIERKRAM_TOKEN || "";
 const SUB = process.env.PAPIERKRAM_SUBDOMAIN || "hbnerdynamics";
 const LABOR_ID = process.env.PAPIERKRAM_LABOR_ID || "";
+const PAYTERM_ID = process.env.PAPIERKRAM_PAYMENT_TERM_ID || "";
+const VAT = process.env.PAPIERKRAM_VAT || "19%";
 const AUTOCREATE = String(process.env.PAPIERKRAM_AUTOCREATE_CONTACT || "true") !== "false";
 const BASE = `https://${SUB}.papierkram.de/api/v1`;
 
@@ -56,15 +59,47 @@ function nameKey(s) {
     .split(/\s+/).filter(Boolean).sort().join(" ");
 }
 
-// ISO (JJJJ-MM-TT) → deutsches Format TT.MM.JJJJ (für supply_date-Freitext)
+// ISO (JJJJ-MM-TT) → TT.MM.JJJJ (für den Beschreibungstext)
 function deDate(iso) {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
   return m ? m[3] + "." + m[2] + "." + m[1] : (iso || "");
 }
 
+// ── Caches (sparen API-Credits über die Server-Laufzeit) ────────────────────
+let laborCache = null;     // { id, name, price, unit }
+let paytermCache = null;   // { id, name }
+
+// Arbeits-Dienstleistung inkl. Preis/Einheit aus Papierkram lesen
+async function getLabor() {
+  if (laborCache) return laborCache;
+  const r = await pk("GET", "/income/propositions");
+  if (!r.ok) return { error: { step: "propositions", status: r.status, papierkram: r.data } };
+  const list = asList(r.data);
+  let hit = null;
+  if (LABOR_ID) hit = list.find(p => String(p.id) === String(LABOR_ID));
+  if (!hit) hit = list.find(p => /stund|arbeit|lohn/i.test(String(p.name || "")));
+  if (!hit && list.length === 1) hit = list[0];
+  if (!hit) return { error: { step: "propositions", msg: "Arbeits-Dienstleistung nicht gefunden – PAPIERKRAM_LABOR_ID prüfen", choices: list.map(p => ({ id: p.id, name: p.name })) } };
+  laborCache = { id: hit.id, name: hit.name || "Arbeitsstunde", price: Number(hit.price) || 0, unit: hit.unit_name_1 || "Stunde" };
+  return laborCache;
+}
+
+// Zahlungsbedingung (Pflichtfeld!) lesen: Env-ID oder erste vorhandene
+async function getPaymentTerm() {
+  if (paytermCache) return paytermCache;
+  const r = await pk("GET", "/income/payment_terms");
+  if (!r.ok) return { error: { step: "payment_terms", status: r.status, papierkram: r.data } };
+  const list = asList(r.data);
+  if (!list.length) return { error: { step: "payment_terms", msg: "Keine Zahlungsbedingung in Papierkram angelegt – bitte eine anlegen (Einstellungen)" } };
+  let hit = null;
+  if (PAYTERM_ID) hit = list.find(p => String(p.id) === String(PAYTERM_ID));
+  if (!hit) hit = list[0];
+  paytermCache = { id: hit.id, name: hit.name || ("ID " + hit.id) };
+  return paytermCache;
+}
+
 // ============================================================================
 // 1) INSPECT — rein lesend, zeigt echte Strukturen deines Kontos.
-//    Browser:  https://huebner-dynamics-api.onrender.com/api/papierkram-inspect
 // ============================================================================
 router.get("/api/papierkram-inspect", async (req, res) => {
   if (!TOKEN) return res.status(500).json({ error: "PAPIERKRAM_TOKEN fehlt (Render Environment)" });
@@ -78,24 +113,12 @@ router.get("/api/papierkram-inspect", async (req, res) => {
     } catch (e) { return { label, path, error: String(e) }; }
   };
   const results = await Promise.all([
+    probe("payment_terms (Zahlungsbedingungen)", "GET", "/income/payment_terms"),
     probe("companies (Kunden)", "GET", "/contact/companies?page_size=2"),
-    probe("rechnung DETAIL (zeigt line_items/customer)", "GET", "/income/invoices/3"),
-    probe("propositions", "GET", "/income/propositions"),
+    probe("rechnung DETAIL", "GET", "/income/invoices/3"),
   ]);
-  res.json({ base: BASE, subdomain: SUB, autocreateContact: AUTOCREATE, laborIdEnv: LABOR_ID || null, results });
+  res.json({ base: BASE, subdomain: SUB, autocreateContact: AUTOCREATE, laborIdEnv: LABOR_ID || null, paytermIdEnv: PAYTERM_ID || null, vat: VAT, results });
 });
-
-// ── Arbeits-Dienstleistung ──────────────────────────────────────────────────
-async function findLaborProposition() {
-  if (LABOR_ID) return { id: Number(LABOR_ID) || LABOR_ID, name: "aus PAPIERKRAM_LABOR_ID" };
-  const r = await pk("GET", "/income/propositions");
-  if (!r.ok) return { error: { step: "propositions", status: r.status, papierkram: r.data } };
-  const list = asList(r.data);
-  const hit = list.find(p => /stund|arbeit|lohn/i.test(String(p.name || "")))
-    || (list.length === 1 ? list[0] : null);
-  if (!hit) return { error: { step: "propositions", msg: "Arbeits-Dienstleistung nicht eindeutig – bitte PAPIERKRAM_LABOR_ID setzen", choices: list.map(p => ({ id: p.id, name: p.name })) } };
-  return { id: hit.id, name: hit.name };
-}
 
 // ── Bestandskunde suchen (Unternehmen-Kontakte, Wortreihenfolge egal) ───────
 async function findContact(name) {
@@ -127,22 +150,6 @@ async function findOrCreateContact(name) {
   return { id, name: clean, created: true };
 }
 
-// ── Rechnungs-Body (Feldnamen aus echter Rechnungsstruktur) ─────────────────
-function buildInvoiceBody({ contactId, kennzeichen, rechnungsdatum, leistungVon, leistungBis, laborId, stunden, teile }) {
-  const lineItems = [];
-  if (stunden && stunden > 0) lineItems.push({ proposition_id: laborId, quantity: stunden });
-  (teile || []).forEach(t => { if (t && String(t).trim()) lineItems.push({ name: String(t).trim(), quantity: 1 }); });
-  const von = deDate(leistungVon), bis = deDate(leistungBis);
-  return {
-    customer_id: contactId,
-    customer: { id: contactId },
-    name: kennzeichen || "Werkstattauftrag",
-    document_date: rechnungsdatum,
-    supply_date: (von && bis && von !== bis) ? (von + " - " + bis) : (bis || von),
-    line_items: lineItems,
-  };
-}
-
 // ============================================================================
 // 2) RECHNUNGSENTWURF ANLEGEN
 //    Frontend schickt: { kennzeichen, halter, leistungVon, leistungBis,
@@ -153,26 +160,35 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
     if (!TOKEN) return res.status(500).json({ ok: false, msg: "PAPIERKRAM_TOKEN fehlt (Render Environment)" });
     const b = req.body || {};
 
-    const labor = await findLaborProposition();
+    const labor = await getLabor();
     if (labor.error) return res.status(502).json({ ok: false, ...labor.error });
+
+    const payterm = await getPaymentTerm();
+    if (payterm.error) return res.status(502).json({ ok: false, ...payterm.error });
 
     const contact = await findOrCreateContact(b.halter);
     if (contact.error) return res.status(502).json({ ok: false, ...contact.error });
 
-    const body = buildInvoiceBody({
-      contactId: contact.id,
-      kennzeichen: b.kennzeichen,
-      rechnungsdatum: b.rechnungsdatum,
-      leistungVon: b.leistungVon,
-      leistungBis: b.leistungBis,
-      laborId: labor.id,
-      stunden: Number(b.stunden) || 0,
-      teile: b.teile || [],
-    });
+    // Positionen: Arbeitsstunden (mit echtem Preis aus Papierkram) + Teile (Preis 0, füllst du aus)
+    const lineItems = [];
+    const stunden = Number(b.stunden) || 0;
+    if (stunden > 0) lineItems.push({ name: labor.name, quantity: stunden, unit: labor.unit, price: labor.price, vat_rate: VAT });
+    (b.teile || []).forEach(t => { const s = String(t || "").trim(); if (s) lineItems.push({ name: s, quantity: 1, unit: "Stück", price: 0, vat_rate: VAT }); });
+
+    const von = deDate(b.leistungVon), bis = deDate(b.leistungBis);
+    const zeitraum = (von && bis && von !== bis) ? (von + " \u2013 " + bis) : (bis || von);
+    const body = {
+      name: b.kennzeichen || "Werkstattauftrag",
+      document_date: b.rechnungsdatum,
+      supply_date: b.leistungBis || b.rechnungsdatum,
+      description: zeitraum ? ("Leistungszeitraum: " + zeitraum) : "",
+      payment_term: { id: payterm.id },
+      customer: { id: contact.id },
+      line_items: lineItems,
+    };
 
     const inv = await pk("POST", "/income/invoices", body);
     if (!inv.ok) {
-      // Papierkram-Antwort im Klartext zurück – damit fixen wir Feldnamen sofort
       return res.status(502).json({ ok: false, step: "invoice_create", status: inv.status, sent: body, papierkram: inv.data });
     }
     const d = inv.data || {};
@@ -182,7 +198,8 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
       invoiceId,
       contactCreated: !!contact.created,
       contactName: contact.name,
-      laborUsed: labor.name || labor.id,
+      laborUsed: labor.name + " (" + labor.price + " \u20AC/" + labor.unit + ")",
+      paymentTerm: payterm.name,
       url: `https://${SUB}.papierkram.de/`,
       papierkram: d,
     });
