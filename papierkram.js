@@ -1,21 +1,18 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// ----------------------------------------------------------------------------
-// ES-Module-Version (passend zu deiner server.js mit `import ... from`).
+// Version 2 — Pfade & Felder an die echte API angepasst (aus /inspect + Doku):
+//   • Kunden = "Unternehmen"-Kontakte unter /contact/companies (auch Privatkunden)
+//   • Rechnung: name (=Kennzeichen), document_date, supply_date (Freitext,
+//     deutsches Format = Leistungszeitraum), line_items, customer
 //
-// EINBINDEN — genau EINE Zeile in server.js oben zu den anderen imports:
+// EINBINDEN (hast du schon): import papierkram from './papierkram.js';
+//                            app.use(papierkram);
 //
-//     import papierkram from './papierkram.js';
-//
-// Die Zeile  app.use(papierkram);  hast du schon richtig platziert
-// (nach app.use(express.json()), vor app.listen). Nichts weiter nötig.
-//
-// Render → Environment (hast du schon gesetzt):
-//     PAPIERKRAM_TOKEN              = <dein API-Token>   (nie ins Frontend!)
+// Render → Environment:
+//     PAPIERKRAM_TOKEN              = <Token>
 //     PAPIERKRAM_SUBDOMAIN          = hbnerdynamics
-//     PAPIERKRAM_LABOR_ID           = (optional) ID der Arbeits-Dienstleistung
-//     PAPIERKRAM_AUTOCREATE_CONTACT = (optional) "false" = neue Kunden NICHT
-//                                     automatisch anlegen (Default: anlegen)
+//     PAPIERKRAM_LABOR_ID           = 3        ← "Arbeitsstunde" (98 €/h), empfohlen!
+//     PAPIERKRAM_AUTOCREATE_CONTACT = (optional) "false" = neue Kunden nicht anlegen
 // ============================================================================
 
 import express from "express";
@@ -45,7 +42,6 @@ async function pk(method, path, body) {
   return { ok: res.ok, status: res.status, data };
 }
 
-// Papierkram-Listen kommen i.d.R. als { entries: [...] }. Beides abfangen.
 function asList(d) {
   if (!d) return [];
   if (Array.isArray(d)) return d;
@@ -54,17 +50,21 @@ function asList(d) {
   return [];
 }
 
-// Namen vereinheitlichen (für Kundenabgleich): klein, Mehrfach-Leerzeichen weg.
-function norm(s) { return (s == null ? "" : String(s)).toLowerCase().replace(/\s+/g, " ").trim(); }
-function contactName(c) {
-  return c.name || c.company_name || c.display_name
-    || ((c.first_name || "") + " " + (c.last_name || "")).trim()
-    || "";
+// Namens-Abgleich: klein, Wörter sortiert → "Palzer Michael" == "Michael Palzer"
+function nameKey(s) {
+  return (s == null ? "" : String(s)).toLowerCase().replace(/[.,]/g, " ")
+    .split(/\s+/).filter(Boolean).sort().join(" ");
+}
+
+// ISO (JJJJ-MM-TT) → deutsches Format TT.MM.JJJJ (für supply_date-Freitext)
+function deDate(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || "");
+  return m ? m[3] + "." + m[2] + "." + m[1] : (iso || "");
 }
 
 // ============================================================================
-// 1) INSPECT — rein lesend. Zeigt, welche Endpunkte/Formate dein Konto liefert.
-//    Im Browser:  https://huebner-dynamics-api.onrender.com/api/papierkram-inspect
+// 1) INSPECT — rein lesend, zeigt echte Strukturen deines Kontos.
+//    Browser:  https://huebner-dynamics-api.onrender.com/api/papierkram-inspect
 // ============================================================================
 router.get("/api/papierkram-inspect", async (req, res) => {
   if (!TOKEN) return res.status(500).json({ error: "PAPIERKRAM_TOKEN fehlt (Render Environment)" });
@@ -78,46 +78,37 @@ router.get("/api/papierkram-inspect", async (req, res) => {
     } catch (e) { return { label, path, error: String(e) }; }
   };
   const results = await Promise.all([
-    probe("info", "GET", "/info"),
-    probe("propositions (Dienstleistungen)", "GET", "/income/propositions"),
-    probe("contacts", "GET", "/contacts"),
-    probe("income_contacts", "GET", "/income/contacts"),
-    probe("invoices (1 Beispiel)", "GET", "/income/invoices?page_size=1"),
+    probe("companies (Kunden)", "GET", "/contact/companies?page_size=2"),
+    probe("rechnung DETAIL (zeigt line_items/customer)", "GET", "/income/invoices/3"),
+    probe("propositions", "GET", "/income/propositions"),
   ]);
-  res.json({ base: BASE, subdomain: SUB, autocreateContact: AUTOCREATE, results });
+  res.json({ base: BASE, subdomain: SUB, autocreateContact: AUTOCREATE, laborIdEnv: LABOR_ID || null, results });
 });
 
-// ── Arbeits-Dienstleistung finden ("auslesen") ──────────────────────────────
+// ── Arbeits-Dienstleistung ──────────────────────────────────────────────────
 async function findLaborProposition() {
-  if (LABOR_ID) return { id: LABOR_ID, source: "env" };
+  if (LABOR_ID) return { id: Number(LABOR_ID) || LABOR_ID, name: "aus PAPIERKRAM_LABOR_ID" };
   const r = await pk("GET", "/income/propositions");
   if (!r.ok) return { error: { step: "propositions", status: r.status, papierkram: r.data } };
   const list = asList(r.data);
-  if (!list.length) return { error: { step: "propositions", status: r.status, msg: "Keine Dienstleistungen gefunden", papierkram: r.data } };
-  const hit = list.find(p => /stund|arbeit|lohn/i.test(JSON.stringify(p.name || p.title || "")))
-    || list.find(p => /stund|\bh\b|hour/i.test(JSON.stringify(p.unit || p.unit_name || "")))
+  const hit = list.find(p => /stund|arbeit|lohn/i.test(String(p.name || "")))
     || (list.length === 1 ? list[0] : null);
-  if (!hit) return { error: { step: "propositions", msg: "Arbeits-Dienstleistung nicht eindeutig – bitte PAPIERKRAM_LABOR_ID setzen", choices: list.map(p => ({ id: p.id, name: p.name || p.title })) } };
-  return { id: hit.id, name: hit.name || hit.title };
+  if (!hit) return { error: { step: "propositions", msg: "Arbeits-Dienstleistung nicht eindeutig – bitte PAPIERKRAM_LABOR_ID setzen", choices: list.map(p => ({ id: p.id, name: p.name })) } };
+  return { id: hit.id, name: hit.name };
 }
 
-// ── Bestandskunde suchen (mehrere Seiten + Namen normalisiert) ──────────────
+// ── Bestandskunde suchen (Unternehmen-Kontakte, Wortreihenfolge egal) ───────
 async function findContact(name) {
-  const target = norm(name);
+  const target = nameKey(name);
   if (!target) return null;
-  // a) Server-Suche versuchen (falls Papierkram ?q= kennt – sonst harmlos ignoriert)
-  let r = await pk("GET", "/contacts?q=" + encodeURIComponent(name));
-  let hit = (r.ok ? asList(r.data) : []).find(c => norm(contactName(c)) === target);
-  if (hit) return hit;
-  // b) paginiert durchsuchen
   for (let page = 1; page <= 10; page++) {
-    r = await pk("GET", "/contacts?page=" + page + "&page_size=100");
-    if (!r.ok) break;
+    const r = await pk("GET", "/contact/companies?page=" + page + "&page_size=100");
+    if (!r.ok) return { httpError: { step: "contact_search", status: r.status, papierkram: r.data } };
     const list = asList(r.data);
     if (!list.length) break;
-    hit = list.find(c => norm(contactName(c)) === target);
+    const hit = list.find(c => nameKey(c.name) === target);
     if (hit) return hit;
-    if (list.length < 100) break; // letzte Seite erreicht
+    if (list.length < 100) break;
   }
   return null;
 }
@@ -126,25 +117,28 @@ async function findOrCreateContact(name) {
   const clean = (name || "").trim();
   if (!clean) return { error: { step: "contact", msg: "Kein Halter-Name übergeben (Fahrzeugschein hatte keinen)" } };
   const found = await findContact(clean);
-  if (found) return { id: found.id, name: contactName(found), created: false };
-  if (!AUTOCREATE) return { error: { step: "contact", msg: "Kunde \"" + clean + "\" nicht gefunden – bitte in Papierkram anlegen/zuordnen (Auto-Anlegen ist aus)" } };
-  const c = await pk("POST", "/contacts", { name: clean });
+  if (found && found.httpError) return { error: found.httpError };
+  if (found) return { id: found.id, name: found.name, created: false };
+  if (!AUTOCREATE) return { error: { step: "contact", msg: "Kunde \"" + clean + "\" nicht gefunden – bitte in Papierkram anlegen (Auto-Anlegen ist aus)" } };
+  const c = await pk("POST", "/contact/companies", { name: clean, contact_type: "customer" });
   if (!c.ok) return { error: { step: "contact_create", status: c.status, sent: { name: clean }, papierkram: c.data } };
-  const id = (c.data && (c.data.id || (c.data.entry && c.data.entry.id))) || null;
+  const d = c.data || {};
+  const id = d.id || (d.entry && d.entry.id) || null;
   return { id, name: clean, created: true };
 }
 
-// ── Rechnungs-Body bauen (eine Stelle, leicht anpassbar nach /inspect) ──────
+// ── Rechnungs-Body (Feldnamen aus echter Rechnungsstruktur) ─────────────────
 function buildInvoiceBody({ contactId, kennzeichen, rechnungsdatum, leistungVon, leistungBis, laborId, stunden, teile }) {
   const lineItems = [];
   if (stunden && stunden > 0) lineItems.push({ proposition_id: laborId, quantity: stunden });
   (teile || []).forEach(t => { if (t && String(t).trim()) lineItems.push({ name: String(t).trim(), quantity: 1 }); });
+  const von = deDate(leistungVon), bis = deDate(leistungBis);
   return {
-    contact_id: contactId,
-    subject: kennzeichen || "",
-    date: rechnungsdatum,
-    service_period_start: leistungVon,
-    service_period_end: leistungBis,
+    customer_id: contactId,
+    customer: { id: contactId },
+    name: kennzeichen || "Werkstattauftrag",
+    document_date: rechnungsdatum,
+    supply_date: (von && bis && von !== bis) ? (von + " - " + bis) : (bis || von),
     line_items: lineItems,
   };
 }
@@ -178,6 +172,7 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
 
     const inv = await pk("POST", "/income/invoices", body);
     if (!inv.ok) {
+      // Papierkram-Antwort im Klartext zurück – damit fixen wir Feldnamen sofort
       return res.status(502).json({ ok: false, step: "invoice_create", status: inv.status, sent: body, papierkram: inv.data });
     }
     const d = inv.data || {};
