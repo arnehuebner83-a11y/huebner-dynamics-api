@@ -1,28 +1,25 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
 // ----------------------------------------------------------------------------
-// EINBINDEN — in deiner Server-Hauptdatei (die mit  const app = express()  ),
-// meist server.js oder index.js, GANZ OBEN bei den anderen require(...):
+// ES-Module-Version (passend zu deiner server.js mit `import ... from`).
 //
-//     const papierkram = require("./papierkram");
+// EINBINDEN — genau EINE Zeile in server.js oben zu den anderen imports:
 //
-// und WEITER UNTEN, NACH  app.use(express.json())  und nach evtl. app.use(cors()),
-// aber VOR  app.listen(...) :
+//     import papierkram from './papierkram.js';
 //
-//     app.use(papierkram);          // stellt /api/papierkram-inspect und
-//                                   //         /api/papierkram-rechnung bereit
+// Die Zeile  app.use(papierkram);  hast du schon richtig platziert
+// (nach app.use(express.json()), vor app.listen). Nichts weiter nötig.
 //
-// Render → Environment → Variablen:
-//     PAPIERKRAM_TOKEN              = <dein API-Token>   (NUR hier, nie im Frontend!)
+// Render → Environment (hast du schon gesetzt):
+//     PAPIERKRAM_TOKEN              = <dein API-Token>   (nie ins Frontend!)
 //     PAPIERKRAM_SUBDOMAIN          = hbnerdynamics
-//     PAPIERKRAM_LABOR_ID           = (optional) ID deiner Arbeits-Dienstleistung
+//     PAPIERKRAM_LABOR_ID           = (optional) ID der Arbeits-Dienstleistung
 //     PAPIERKRAM_AUTOCREATE_CONTACT = (optional) "false" = neue Kunden NICHT
 //                                     automatisch anlegen (Default: anlegen)
-//
-// Braucht Node 18+ (globales fetch). express.json() muss aktiv sein (req.body).
 // ============================================================================
 
-const express = require("express");
+import express from "express";
+
 const router = express.Router();
 
 const TOKEN = process.env.PAPIERKRAM_TOKEN || "";
@@ -199,4 +196,4 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;
