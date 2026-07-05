@@ -1,7 +1,9 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 3 — POST-Format verifiziert (payment_term Pflicht & verschachtelt,
-// customer verschachtelt, line_items mit Name/Menge/Einheit/Preis/MwSt).
+// Version 4 — Fix für "Firma / Kontaktname muss ein Kunde sein":
+//   Nach Finden/Anlegen wird der Kontakttyp GEPRÜFT und, falls nötig,
+//   per PUT auf "Kunde" umgestellt. Klappt auch das nicht (API-Beta),
+//   kommt eine klare Anleitung statt eines kryptischen Fehlers.
 //
 // EINBINDEN (unverändert): import papierkram from './papierkram.js';
 //                          app.use(papierkram);
@@ -9,10 +11,10 @@
 // Render → Environment:
 //     PAPIERKRAM_TOKEN              = <Token>
 //     PAPIERKRAM_SUBDOMAIN          = hbnerdynamics
-//     PAPIERKRAM_LABOR_ID           = 3          ← "Arbeitsstunde" (empfohlen)
-//     PAPIERKRAM_PAYMENT_TERM_ID    = (optional) feste Zahlungsbedingung;
-//                                     sonst wird automatisch die erste genommen
-//     PAPIERKRAM_VAT                = (optional) MwSt-Satz, Default "19%"
+//     PAPIERKRAM_LABOR_ID           = 3          ← "Arbeitsstunde"
+//     PAPIERKRAM_PAYMENT_TERM_ID    = 24         ← "Auf Rechnung, 14 Tage (rein netto)" – EMPFOHLEN,
+//                                     sonst wird die erste genommen (bei dir: Barzahlung!)
+//     PAPIERKRAM_VAT                = (optional) Default "19%"
 //     PAPIERKRAM_AUTOCREATE_CONTACT = (optional) "false" = neue Kunden nicht anlegen
 // ============================================================================
 
@@ -53,6 +55,8 @@ function asList(d) {
   return [];
 }
 
+function unwrap(d) { return (d && d.entry) ? d.entry : (d || {}); }
+
 // Namens-Abgleich: klein, Wörter sortiert → "Palzer Michael" == "Michael Palzer"
 function nameKey(s) {
   return (s == null ? "" : String(s)).toLowerCase().replace(/[.,]/g, " ")
@@ -69,7 +73,6 @@ function deDate(iso) {
 let laborCache = null;     // { id, name, price, unit }
 let paytermCache = null;   // { id, name }
 
-// Arbeits-Dienstleistung inkl. Preis/Einheit aus Papierkram lesen
 async function getLabor() {
   if (laborCache) return laborCache;
   const r = await pk("GET", "/income/propositions");
@@ -84,7 +87,6 @@ async function getLabor() {
   return laborCache;
 }
 
-// Zahlungsbedingung (Pflichtfeld!) lesen: Env-ID oder erste vorhandene
 async function getPaymentTerm() {
   if (paytermCache) return paytermCache;
   const r = await pk("GET", "/income/payment_terms");
@@ -120,6 +122,20 @@ router.get("/api/papierkram-inspect", async (req, res) => {
   res.json({ base: BASE, subdomain: SUB, autocreateContact: AUTOCREATE, laborIdEnv: LABOR_ID || null, paytermIdEnv: PAYTERM_ID || null, vat: VAT, results });
 });
 
+// ── Kontakttyp sicherstellen: muss "customer" sein ──────────────────────────
+async function ensureCustomer(company) {
+  if ((company.contact_type || "") === "customer") return company;
+  // Reparaturversuch per PUT (Name mitschicken, falls Pflichtfeld)
+  const u = await pk("PUT", "/contact/companies/" + company.id, { name: company.name, contact_type: "customer" });
+  let fresh = u.ok ? unwrap(u.data) : null;
+  if (!fresh || (fresh.contact_type || "") !== "customer") {
+    const g = await pk("GET", "/contact/companies/" + company.id);
+    if (g.ok) fresh = unwrap(g.data);
+  }
+  if (fresh && (fresh.contact_type || "") === "customer") return { id: company.id, name: fresh.name || company.name, contact_type: "customer" };
+  return { needsManual: true };
+}
+
 // ── Bestandskunde suchen (Unternehmen-Kontakte, Wortreihenfolge egal) ───────
 async function findContact(name) {
   const target = nameKey(name);
@@ -139,15 +155,29 @@ async function findContact(name) {
 async function findOrCreateContact(name) {
   const clean = (name || "").trim();
   if (!clean) return { error: { step: "contact", msg: "Kein Halter-Name übergeben (Fahrzeugschein hatte keinen)" } };
+
   const found = await findContact(clean);
   if (found && found.httpError) return { error: found.httpError };
-  if (found) return { id: found.id, name: found.name, created: false };
-  if (!AUTOCREATE) return { error: { step: "contact", msg: "Kunde \"" + clean + "\" nicht gefunden – bitte in Papierkram anlegen (Auto-Anlegen ist aus)" } };
-  const c = await pk("POST", "/contact/companies", { name: clean, contact_type: "customer" });
-  if (!c.ok) return { error: { step: "contact_create", status: c.status, sent: { name: clean }, papierkram: c.data } };
-  const d = c.data || {};
-  const id = d.id || (d.entry && d.entry.id) || null;
-  return { id, name: clean, created: true };
+
+  let company = null, created = false;
+  if (found) {
+    company = { id: found.id, name: found.name, contact_type: found.contact_type };
+  } else {
+    if (!AUTOCREATE) return { error: { step: "contact", msg: "Kunde \"" + clean + "\" nicht gefunden – bitte in Papierkram anlegen (Auto-Anlegen ist aus)" } };
+    const c = await pk("POST", "/contact/companies", { name: clean, contact_type: "customer" });
+    if (!c.ok) return { error: { step: "contact_create", status: c.status, sent: { name: clean }, papierkram: c.data } };
+    const d = unwrap(c.data);
+    if (!d.id) return { error: { step: "contact_create", msg: "Kontakt angelegt, aber keine ID in der Antwort", papierkram: c.data } };
+    company = { id: d.id, name: d.name || clean, contact_type: d.contact_type };
+    created = true;
+  }
+
+  // Kundenstatus prüfen und ggf. reparieren (Fix für "muss ein Kunde sein")
+  const ensured = await ensureCustomer(company);
+  if (ensured.needsManual) {
+    return { error: { step: "contact_type", msg: "Kontakt \"" + company.name + "\" (ID " + company.id + ") ist in Papierkram nicht als KUNDE typisiert und ließ sich per API nicht umstellen. Bitte in Papierkram den Kontakt öffnen, Kontaktart auf \"Kunde\" stellen, dann erneut versuchen." } };
+  }
+  return { id: ensured.id || company.id, name: ensured.name || company.name, created };
 }
 
 // ============================================================================
@@ -169,11 +199,12 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
     const contact = await findOrCreateContact(b.halter);
     if (contact.error) return res.status(502).json({ ok: false, ...contact.error });
 
-    // Positionen: Arbeitsstunden (mit echtem Preis aus Papierkram) + Teile (Preis 0, füllst du aus)
+    // Positionen: Arbeitsstunden (echter Preis aus Papierkram) + Teile (Preis 0, füllst du aus)
     const lineItems = [];
     const stunden = Number(b.stunden) || 0;
     if (stunden > 0) lineItems.push({ name: labor.name, quantity: stunden, unit: labor.unit, price: labor.price, vat_rate: VAT });
     (b.teile || []).forEach(t => { const s = String(t || "").trim(); if (s) lineItems.push({ name: s, quantity: 1, unit: "Stück", price: 0, vat_rate: VAT }); });
+    if (!lineItems.length) return res.status(400).json({ ok: false, msg: "Keine Positionen (weder Stunden noch Teile) – Rechnung wäre leer." });
 
     const von = deDate(b.leistungVon), bis = deDate(b.leistungBis);
     const zeitraum = (von && bis && von !== bis) ? (von + " \u2013 " + bis) : (bis || von);
@@ -191,11 +222,10 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
     if (!inv.ok) {
       return res.status(502).json({ ok: false, step: "invoice_create", status: inv.status, sent: body, papierkram: inv.data });
     }
-    const d = inv.data || {};
-    const invoiceId = d.id || (d.entry && d.entry.id) || null;
+    const d = unwrap(inv.data);
     return res.json({
       ok: true,
-      invoiceId,
+      invoiceId: d.id || null,
       contactCreated: !!contact.created,
       contactName: contact.name,
       laborUsed: labor.name + " (" + labor.price + " \u20AC/" + labor.unit + ")",
