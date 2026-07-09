@@ -10,7 +10,7 @@ app.use(papierkram);
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const MODEL = 'claude-sonnet-4-6';
-const BUILD = '2026-05-31-1';
+const BUILD = '2026-07-09-1';
 
 // Health-/Versions-Check: einfach https://huebner-dynamics-api.onrender.com/ im Browser oeffnen.
 // Zeigt, welches Modell und welcher Build gerade LIVE laufen.
@@ -43,6 +43,7 @@ SO IST DAS FORMULAR AUFGEBAUT:
 - HERSTELLER (Feld D.1): z.B. "BMW".
 - MODELL (Feld D.3, Handelsbezeichnung): die längere Typbezeichnung wie "430d" oder "318ti" - KEIN kurzer 2-Zeichen-Code.
 - HALTER: Feld C.1.1 (Name) + C.1.2 (Vorname) zusammen, z.B. "Gräfin zu Münster Astrid".
+- ANSCHRIFT des Halters (Feld C.1.3, steht DIREKT UNTER dem Halternamen): Straße mit Hausnummer (z.B. "Rheinstraße 35 A"), darunter PLZ (genau 5 Ziffern) und Ort (z.B. "64319 Pfungstadt"). Trenne das in drei Werte: strasse, plz, ort.
 - ERSTZULASSUNG (Feld B): Datum TT.MM.JJJJ.
 
 VORGEHEN (wichtig, in dieser Reihenfolge):
@@ -52,11 +53,12 @@ VORGEHEN (wichtig, in dieser Reihenfolge):
 
 REGELN:
 - Lies NUR, was wirklich dasteht - errate nichts.
+- ROTATION: Gib zusätzlich an, um wie viel Grad das Bild IM UHRZEIGERSINN gedreht werden muss, damit der Text normal lesbar (richtig herum) ist: 0, 90, 180 oder 270. Steht der Text auf dem Kopf, ist es 180.
 - Wenn ein Feld nicht sicher lesbar ist: leerer String "".
 - HSN immer genau 4 Ziffern.
 
 Format (eine kurze Transkription davor ist erlaubt, danach GENAU EIN JSON-Objekt):
-{"kennzeichen":"","fin":"","hsn":"","tsn":"","hersteller":"","modell":"","halter":"","erstzulassung":""}` },
+{"kennzeichen":"","fin":"","hsn":"","tsn":"","hersteller":"","modell":"","halter":"","erstzulassung":"","strasse":"","plz":"","ort":"","rotation":0}` },
         ],
       }],
     });
@@ -85,6 +87,10 @@ Format (eine kurze Transkription davor ist erlaubt, danach GENAU EIN JSON-Objekt
       modell: (p.modell || '').trim(),
       halter: (p.halter || '').trim(),
       erstzulassung: (p.erstzulassung || '').trim(),
+      strasse: (p.strasse || '').trim(),
+      plz: (p.plz || '').replace(/[^0-9]/g, '').slice(0, 5),
+      ort: (p.ort || '').trim(),
+      rotation: [0, 90, 180, 270].includes(Number(p.rotation)) ? Number(p.rotation) : 0,
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });

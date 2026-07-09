@@ -152,7 +152,7 @@ async function findContact(name) {
   return null;
 }
 
-async function findOrCreateContact(name) {
+async function findOrCreateContact(name, adr) {
   const clean = (name || "").trim();
   if (!clean) return { error: { step: "contact", msg: "Kein Halter-Name übergeben (Fahrzeugschein hatte keinen)" } };
 
@@ -164,7 +164,18 @@ async function findOrCreateContact(name) {
     company = { id: found.id, name: found.name, contact_type: found.contact_type };
   } else {
     if (!AUTOCREATE) return { error: { step: "contact", msg: "Kunde \"" + clean + "\" nicht gefunden – bitte in Papierkram anlegen (Auto-Anlegen ist aus)" } };
-    const c = await pk("POST", "/contact/companies", { name: clean, contact_type: "customer" });
+    const createBody = { name: clean, contact_type: "customer" };
+    const hasAdr = adr && (adr.street || adr.zip || adr.city);
+    if (hasAdr) {
+      if (adr.street) createBody.postal_street = adr.street;
+      if (adr.zip) createBody.postal_zip = adr.zip;
+      if (adr.city) createBody.postal_city = adr.city;
+    }
+    let c = await pk("POST", "/contact/companies", createBody);
+    if (!c.ok && hasAdr) {
+      // Rechnung darf nie an der Adresse scheitern: ohne Adresse erneut versuchen
+      c = await pk("POST", "/contact/companies", { name: clean, contact_type: "customer" });
+    }
     if (!c.ok) return { error: { step: "contact_create", status: c.status, sent: { name: clean }, papierkram: c.data } };
     const d = unwrap(c.data);
     if (!d.id) return { error: { step: "contact_create", msg: "Kontakt angelegt, aber keine ID in der Antwort", papierkram: c.data } };
@@ -196,14 +207,19 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
     const payterm = await getPaymentTerm();
     if (payterm.error) return res.status(502).json({ ok: false, ...payterm.error });
 
-    const contact = await findOrCreateContact(b.halter);
+    const contact = await findOrCreateContact(b.halter, { street: String(b.strasse || "").trim(), zip: String(b.plz || "").trim(), city: String(b.ort || "").trim() });
     if (contact.error) return res.status(502).json({ ok: false, ...contact.error });
 
     // Positionen: Arbeitsstunden (echter Preis aus Papierkram) + Teile (Preis 0, füllst du aus)
     const lineItems = [];
     const stunden = Number(b.stunden) || 0;
     if (stunden > 0) lineItems.push({ name: labor.name, quantity: stunden, unit: labor.unit, price: labor.price, vat_rate: VAT });
-    (b.teile || []).forEach(t => { const s = String(t || "").trim(); if (s) lineItems.push({ name: s, quantity: 1, unit: "Stück", price: 0, vat_rate: VAT }); });
+    const mitPreisen = Array.isArray(b.teileMitPreisen) && b.teileMitPreisen.length ? b.teileMitPreisen : null;
+    if (mitPreisen) {
+      mitPreisen.forEach(t => { const s = String((t && t.name) || "").trim(); if (s) lineItems.push({ name: s, quantity: 1, unit: "Stück", price: Number(t && t.preis) || 0, vat_rate: VAT }); });
+    } else {
+      (b.teile || []).forEach(t => { const s = String(t || "").trim(); if (s) lineItems.push({ name: s, quantity: 1, unit: "Stück", price: 0, vat_rate: VAT }); });
+    }
     if (!lineItems.length) return res.status(400).json({ ok: false, msg: "Keine Positionen (weder Stunden noch Teile) – Rechnung wäre leer." });
 
     const von = deDate(b.leistungVon), bis = deDate(b.leistungBis);
