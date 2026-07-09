@@ -1,6 +1,7 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 6 — Beleg-Import (Ausgabe-Belege aus Lieferanten-PDFs), Kundenadresse,
+// Version 7 — Beleg-Fix: vat_rate als Zahl (0.19) laut API-Schema,
+//              kein Fallback ohne line_items mehr (Pflichtfeld). Vorher: Version 6 — Beleg-Import (Ausgabe-Belege aus Lieferanten-PDFs), Kundenadresse,
 //              Teilepreise auf Rechnungen. Basis: Version 4:
 //   Nach Finden/Anlegen wird der Kontakttyp GEPRÜFT und, falls nötig,
 //   per PUT auf "Kunde" umgestellt. Klappt auch das nicht (API-Beta),
@@ -276,14 +277,17 @@ router.post("/api/beleg-anlegen", async (req, res) => {
     const KAT = process.env.PAPIERKRAM_BELEG_KATEGORIE || "Wareneinkauf";
     const name = ((b.lieferant || "Beleg") + (b.rechnungsnummer ? " " + b.rechnungsnummer : "")).slice(0, 100);
     const docDate = isoFromDe(b.datum) || new Date().toISOString().split("T")[0];
+    // API-Schema (verifiziert): vat_rate ist eine ZAHL (z.B. 0.19), category ein Name-String
+    const VAT_NUM = (parseFloat(String(VAT).replace("%", "").replace(",", ".")) || 19) / 100;
     const items = (Array.isArray(b.positionen) ? b.positionen : [])
       .map(p => ({
         name: [String((p && p.bezeichnung) || "").trim(), (Number(p && p.menge) || 1) > 1 ? (Number(p.menge) + " Stk \u00e0 " + round2(p.einzelpreis).toFixed(2) + " \u20ac") : ""].filter(Boolean).join(" \u00b7 ").slice(0, 150),
         amount: round2((Number(p && p.menge) || 1) * (Number(p && p.einzelpreis) || 0)),
-        vat_rate: VAT,
+        vat_rate: VAT_NUM,
         category: KAT,
       }))
       .filter(i => i.name);
+    if (!items.length) return res.status(400).json({ ok: false, error: "Mindestens eine Position wird ben\u00f6tigt (line_items ist bei Papierkram Pflicht)." });
 
     const body = {
       name,
@@ -293,21 +297,8 @@ router.post("/api/beleg-anlegen", async (req, res) => {
       line_items: items,
     };
 
-    let v = await pk("POST", "/expense/vouchers", body);
-    let itemsUsed = true;
-    if (!v.ok && items.length) {
-      // Fallback: Schema-Abweichung bei line_items → Beleg ohne Positionen anlegen,
-      // Summen in die Beschreibung. Der Beleg darf nie an den Positionen scheitern.
-      const fb = {
-        name,
-        document_date: docDate,
-        description: body.description + " \u2013 Netto " + round2(b.netto).toFixed(2) + " \u20ac / Brutto " + round2(b.brutto).toFixed(2) + " \u20ac (Positionen siehe PDF)",
-        provenance: "domestic",
-      };
-      v = await pk("POST", "/expense/vouchers", fb);
-      itemsUsed = false;
-      if (!v.ok) return res.status(502).json({ ok: false, step: "voucher_create", status: v.status, sent: body, fallbackSent: fb, papierkram: v.data });
-    }
+    const v = await pk("POST", "/expense/vouchers", body);
+    const itemsUsed = true;
     if (!v.ok) return res.status(502).json({ ok: false, step: "voucher_create", status: v.status, sent: body, papierkram: v.data });
 
     const d = unwrap(v.data);
