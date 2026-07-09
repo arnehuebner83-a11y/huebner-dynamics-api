@@ -10,7 +10,7 @@ app.use(papierkram);
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const MODEL = 'claude-sonnet-4-6';
-const BUILD = '2026-07-09-1';
+const BUILD = '2026-07-09-2';
 
 // Health-/Versions-Check: einfach https://huebner-dynamics-api.onrender.com/ im Browser oeffnen.
 // Zeigt, welches Modell und welcher Build gerade LIVE laufen.
@@ -91,6 +91,68 @@ Format (eine kurze Transkription davor ist erlaubt, danach GENAU EIN JSON-Objekt
       plz: (p.plz || '').replace(/[^0-9]/g, '').slice(0, 5),
       ort: (p.ort || '').trim(),
       rotation: [0, 90, 180, 270].includes(Number(p.rotation)) ? Number(p.rotation) : 0,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/beleg-auslesen', async (req, res) => {
+  try {
+    const { pdfB64 } = req.body;
+    if (!pdfB64) throw new Error('Kein PDF vorhanden');
+
+    const response = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2500,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfB64 } },
+          { type: 'text', text: `Du liest deutsche Lieferanten-Rechnungen einer Kfz-Werkstatt aus (z.B. Baltz Autoteile, Emil Frey/BMW, Wolz).
+
+WICHTIGSTE REGEL — PREISE:
+Nimm bei jeder Position IMMER den EINZEL-/LISTENPREIS NETTO VOR RABATT (den höheren Preis), NIE den rabattierten Betrag:
+- Layout mit Spalten "Einzel-Preis | Rab% | Gesamt-Netto Pr." (z.B. Baltz): nimm "Einzel-Preis".
+- Layout mit Spalten "Preis | Betrag" plus Rabatt-Prozent hinter dem Betrag (z.B. Emil Frey/BMW): nimm "Preis" (Stückpreis).
+- Gibt es keine Rabattspalte, ist der Einzelpreis netto zu nehmen.
+
+WEITERE FELDER:
+- lieferant: Firmenname des Rechnungsstellers (z.B. "BALTZ Autoteile-Zubehör", "Emil Frey Vogel Automobile").
+- rechnungsnummer: die Rechnungs-Nr. (Re.Nr / Rechnungs-Nr.).
+- datum: Rechnungsdatum TT.MM.JJJJ.
+- positionen: JEDE Position mit artikelnummer (falls vorhanden), bezeichnung, menge (Zahl), einzelpreisNetto (Zahl, Punkt als Dezimaltrenner). Auch Pauschalen (z.B. Servicepauschale) und Versandkosten als Position aufnehmen; wenn nur ein Gesamtbetrag dasteht, menge 1 und diesen Betrag als einzelpreisNetto.
+- nettoGesamt, ustBetrag, brutto: die Summen unten auf der Rechnung (Zahlen).
+
+REGELN: Lies NUR, was dasteht. Unsichere Felder: leer bzw. 0. Antworte mit GENAU EINEM JSON-Objekt:
+{"lieferant":"","rechnungsnummer":"","datum":"","positionen":[{"artikelnummer":"","bezeichnung":"","menge":1,"einzelpreisNetto":0}],"nettoGesamt":0,"ustBetrag":0,"brutto":0}` },
+        ],
+      }],
+    });
+
+    const raw = response.content?.[0]?.text || '';
+    let p = {};
+    try {
+      const m = raw.match(/\{[\s\S]*\}/);
+      p = m ? JSON.parse(m[0]) : {};
+    } catch (e) { p = {}; }
+
+    const num = v => { const n = Number(String(v == null ? '' : v).replace(',', '.')); return isNaN(n) ? 0 : Math.round(n * 100) / 100; };
+    res.json({
+      success: true,
+      build: BUILD,
+      lieferant: (p.lieferant || '').trim(),
+      rechnungsnummer: String(p.rechnungsnummer || '').trim(),
+      datum: (p.datum || '').trim(),
+      positionen: (Array.isArray(p.positionen) ? p.positionen : []).map(x => ({
+        artikelnummer: String((x && x.artikelnummer) || '').trim(),
+        bezeichnung: String((x && x.bezeichnung) || '').trim(),
+        menge: num(x && x.menge) || 1,
+        einzelpreisNetto: num(x && x.einzelpreisNetto),
+      })).filter(x => x.bezeichnung),
+      nettoGesamt: num(p.nettoGesamt),
+      ustBetrag: num(p.ustBetrag),
+      brutto: num(p.brutto),
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });

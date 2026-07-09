@@ -1,6 +1,7 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 4 — Fix für "Firma / Kontaktname muss ein Kunde sein":
+// Version 6 — Beleg-Import (Ausgabe-Belege aus Lieferanten-PDFs), Kundenadresse,
+//              Teilepreise auf Rechnungen. Basis: Version 4:
 //   Nach Finden/Anlegen wird der Kontakttyp GEPRÜFT und, falls nötig,
 //   per PUT auf "Kunde" umgestellt. Klappt auch das nicht (API-Beta),
 //   kommt eine klare Anleitung statt eines kryptischen Fehlers.
@@ -251,6 +252,85 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
     });
   } catch (e) {
     return res.status(500).json({ ok: false, msg: "Serverfehler", detail: String(e) });
+  }
+});
+
+// ── Beleg-Import: rein lesende Diagnose (Schema vorhandener Belege ansehen) ──
+router.get("/api/voucher-inspect", async (req, res) => {
+  const r = await pk("GET", "/expense/vouchers?page_size=3");
+  res.json({ status: r.status, data: r.data });
+});
+
+// TT.MM.JJJJ → ISO; sonst heutiges Datum
+function isoFromDe(s) {
+  const m = /^(\d{1,2})\.(\d{1,2})\.(\d{4})/.exec(String(s || "").trim());
+  if (!m) return null;
+  return m[3] + "-" + m[2].padStart(2, "0") + "-" + m[1].padStart(2, "0");
+}
+function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+
+// ── Beleg-Import: Ausgabe-Beleg anlegen (+ PDF anhängen, wenn möglich) ──
+router.post("/api/beleg-anlegen", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const KAT = process.env.PAPIERKRAM_BELEG_KATEGORIE || "Wareneinkauf";
+    const name = ((b.lieferant || "Beleg") + (b.rechnungsnummer ? " " + b.rechnungsnummer : "")).slice(0, 100);
+    const docDate = isoFromDe(b.datum) || new Date().toISOString().split("T")[0];
+    const items = (Array.isArray(b.positionen) ? b.positionen : [])
+      .map(p => ({
+        name: [String((p && p.bezeichnung) || "").trim(), (Number(p && p.menge) || 1) > 1 ? (Number(p.menge) + " Stk \u00e0 " + round2(p.einzelpreis).toFixed(2) + " \u20ac") : ""].filter(Boolean).join(" \u00b7 ").slice(0, 150),
+        amount: round2((Number(p && p.menge) || 1) * (Number(p && p.einzelpreis) || 0)),
+        vat_rate: VAT,
+        category: KAT,
+      }))
+      .filter(i => i.name);
+
+    const body = {
+      name,
+      document_date: docDate,
+      description: "Automatisch aus PDF \u00fcbernommen" + (b.rechnungsnummer ? " (Re.Nr " + b.rechnungsnummer + ")" : ""),
+      provenance: "domestic",
+      line_items: items,
+    };
+
+    let v = await pk("POST", "/expense/vouchers", body);
+    let itemsUsed = true;
+    if (!v.ok && items.length) {
+      // Fallback: Schema-Abweichung bei line_items → Beleg ohne Positionen anlegen,
+      // Summen in die Beschreibung. Der Beleg darf nie an den Positionen scheitern.
+      const fb = {
+        name,
+        document_date: docDate,
+        description: body.description + " \u2013 Netto " + round2(b.netto).toFixed(2) + " \u20ac / Brutto " + round2(b.brutto).toFixed(2) + " \u20ac (Positionen siehe PDF)",
+        provenance: "domestic",
+      };
+      v = await pk("POST", "/expense/vouchers", fb);
+      itemsUsed = false;
+      if (!v.ok) return res.status(502).json({ ok: false, step: "voucher_create", status: v.status, sent: body, fallbackSent: fb, papierkram: v.data });
+    }
+    if (!v.ok) return res.status(502).json({ ok: false, step: "voucher_create", status: v.status, sent: body, papierkram: v.data });
+
+    const d = unwrap(v.data);
+
+    // PDF anhängen (best effort – Beleg existiert auch ohne Anhang)
+    let pdfAttached = false;
+    if (b.pdfB64 && d.id) {
+      try {
+        const fd = new FormData();
+        const buf = Buffer.from(b.pdfB64, "base64");
+        fd.append("document", new Blob([buf], { type: "application/pdf" }), (b.pdfName || "beleg.pdf"));
+        const up = await fetch(BASE + "/expense/vouchers/" + d.id + "/documents", {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + TOKEN, "Accept": "application/json" },
+          body: fd,
+        });
+        pdfAttached = up.ok;
+      } catch (e) { pdfAttached = false; }
+    }
+
+    res.json({ ok: true, voucherId: d.id || null, voucherNo: d.voucher_no || "", name, itemsUsed, pdfAttached });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
