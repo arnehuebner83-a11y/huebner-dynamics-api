@@ -1,6 +1,7 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 8 — Kategorie-Fix: "Wareneingang" (gueltige Papierkram-Kategorie,
+// Version 9 — PDF-Anhang-Fix: Multipart-Feld heisst "file" (aus Client-Quelltext
+//              verifiziert). Vorher: Version 8 — Kategorie-Fix: "Wareneingang" (gueltige Papierkram-Kategorie,
 //              "Wareneinkauf" existiert nicht). Vorher: Version 7 — Beleg-Fix: vat_rate als Zahl (0.19) laut API-Schema,
 //              kein Fallback ohne line_items mehr (Pflichtfeld). Vorher: Version 6 — Beleg-Import (Ausgabe-Belege aus Lieferanten-PDFs), Kundenadresse,
 //              Teilepreise auf Rechnungen. Basis: Version 4:
@@ -310,7 +311,7 @@ router.post("/api/beleg-anlegen", async (req, res) => {
       try {
         const fd = new FormData();
         const buf = Buffer.from(b.pdfB64, "base64");
-        fd.append("document", new Blob([buf], { type: "application/pdf" }), (b.pdfName || "beleg.pdf"));
+        fd.append("file", new Blob([buf], { type: "application/pdf" }), (b.pdfName || "beleg.pdf"));
         const up = await fetch(BASE + "/expense/vouchers/" + d.id + "/documents", {
           method: "POST",
           headers: { "Authorization": "Bearer " + TOKEN, "Accept": "application/json" },
