@@ -1,6 +1,7 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 7 — Beleg-Fix: vat_rate als Zahl (0.19) laut API-Schema,
+// Version 8 — Kategorie-Fix: "Wareneingang" (gueltige Papierkram-Kategorie,
+//              "Wareneinkauf" existiert nicht). Vorher: Version 7 — Beleg-Fix: vat_rate als Zahl (0.19) laut API-Schema,
 //              kein Fallback ohne line_items mehr (Pflichtfeld). Vorher: Version 6 — Beleg-Import (Ausgabe-Belege aus Lieferanten-PDFs), Kundenadresse,
 //              Teilepreise auf Rechnungen. Basis: Version 4:
 //   Nach Finden/Anlegen wird der Kontakttyp GEPRÜFT und, falls nötig,
@@ -274,7 +275,7 @@ function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 router.post("/api/beleg-anlegen", async (req, res) => {
   try {
     const b = req.body || {};
-    const KAT = process.env.PAPIERKRAM_BELEG_KATEGORIE || "Wareneinkauf";
+    const KAT = process.env.PAPIERKRAM_BELEG_KATEGORIE || "Wareneingang";
     const name = ((b.lieferant || "Beleg") + (b.rechnungsnummer ? " " + b.rechnungsnummer : "")).slice(0, 100);
     const docDate = isoFromDe(b.datum) || new Date().toISOString().split("T")[0];
     // API-Schema (verifiziert): vat_rate ist eine ZAHL (z.B. 0.19), category ein Name-String
