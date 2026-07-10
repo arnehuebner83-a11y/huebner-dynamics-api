@@ -1,6 +1,7 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 9 — PDF-Anhang-Fix: Multipart-Feld heisst "file" (aus Client-Quelltext
+// Version 10 — Beleg bucht BEZAHLTE Netto-Betraege (nach Rabatt); Rueckweg:
+//               Beleg-Liste + PDF-Download aus Papierkram. Vorher: Version 9 — PDF-Anhang-Fix: Multipart-Feld heisst "file" (aus Client-Quelltext
 //              verifiziert). Vorher: Version 8 — Kategorie-Fix: "Wareneingang" (gueltige Papierkram-Kategorie,
 //              "Wareneinkauf" existiert nicht). Vorher: Version 7 — Beleg-Fix: vat_rate als Zahl (0.19) laut API-Schema,
 //              kein Fallback ohne line_items mehr (Pflichtfeld). Vorher: Version 6 — Beleg-Import (Ausgabe-Belege aus Lieferanten-PDFs), Kundenadresse,
@@ -272,6 +273,73 @@ function isoFromDe(s) {
 }
 function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 
+// ── Rückweg: letzte Belege auflisten ──
+router.get("/api/beleg-liste", async (req, res) => {
+  const r = await pk("GET", "/expense/vouchers?page_size=20");
+  if (!r.ok) return res.status(502).json({ ok: false, status: r.status, papierkram: r.data });
+  const u = r.data || {};
+  const entries = u.entries || (u.data && u.data.entries) || [];
+  res.json({ ok: true, belege: entries.map(v => ({ id: v.id, name: v.name, voucher_no: v.voucher_no, document_date: v.document_date, amount: v.amount })) });
+});
+
+// ── Rückweg: PDF-Anhang eines Belegs laden (defensiv, Format teils undokumentiert) ──
+router.get("/api/beleg-pdf/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    let list = [];
+    const docs = await pk("GET", "/expense/vouchers/" + id + "/documents");
+    if (docs.ok) {
+      const u = docs.data || {};
+      list = Array.isArray(u) ? u : (u.entries || (u.data && u.data.entries) || []);
+    }
+    if (!list.length) {
+      const det = await pk("GET", "/expense/vouchers/" + id);
+      const d = unwrap(det.data) || {};
+      list = d.documents || [];
+      if (!list.length) return res.status(404).json({ ok: false, step: "no_documents", voucherId: id, docsStatus: docs.status, docsRaw: docs.data });
+    }
+    const first = list[0] || {};
+    const docId = first.id || first.document_id;
+
+    async function toB64(r2) {
+      const ab = await r2.arrayBuffer();
+      return Buffer.from(ab).toString("base64");
+    }
+
+    // Direkter Download-Versuch über die Dokument-Ressource
+    if (docId) {
+      const r2 = await fetch(BASE + "/expense/vouchers/" + id + "/documents/" + docId, { headers: { "Authorization": "Bearer " + TOKEN } });
+      const ct = (r2.headers.get("content-type") || "").toLowerCase();
+      if (r2.ok && ct.indexOf("json") < 0) return res.json({ ok: true, pdfB64: await toB64(r2) });
+      if (r2.ok) {
+        // JSON-Metadaten: nach einer Datei-URL suchen
+        const meta = await r2.json().catch(() => ({}));
+        const m = unwrap(meta) || meta || {};
+        const url = m.url || m.file_url || m.download_url || (m.file && m.file.url);
+        if (url) {
+          const abs = url.indexOf("http") === 0 ? url : BASE.replace("/api/v1", "") + url;
+          const r3 = await fetch(abs, abs.indexOf(BASE) === 0 ? { headers: { "Authorization": "Bearer " + TOKEN } } : {});
+          if (r3.ok) return res.json({ ok: true, pdfB64: await toB64(r3) });
+          return res.status(502).json({ ok: false, step: "file_url_download", status: r3.status, url: abs });
+        }
+        return res.status(502).json({ ok: false, step: "no_file_url", meta: m });
+      }
+      return res.status(502).json({ ok: false, step: "document_get", status: r2.status });
+    }
+    // Kein docId: vielleicht enthaelt der Eintrag selbst eine URL
+    const url0 = first.url || first.file_url || first.download_url;
+    if (url0) {
+      const abs = url0.indexOf("http") === 0 ? url0 : BASE.replace("/api/v1", "") + url0;
+      const r4 = await fetch(abs, abs.indexOf(BASE) === 0 ? { headers: { "Authorization": "Bearer " + TOKEN } } : {});
+      if (r4.ok) return res.json({ ok: true, pdfB64: await toB64(r4) });
+      return res.status(502).json({ ok: false, step: "entry_url_download", status: r4.status, url: abs });
+    }
+    return res.status(404).json({ ok: false, step: "no_document_id", list });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Beleg-Import: Ausgabe-Beleg anlegen (+ PDF anhängen, wenn möglich) ──
 router.post("/api/beleg-anlegen", async (req, res) => {
   try {
@@ -284,7 +352,7 @@ router.post("/api/beleg-anlegen", async (req, res) => {
     const items = (Array.isArray(b.positionen) ? b.positionen : [])
       .map(p => ({
         name: [String((p && p.bezeichnung) || "").trim(), (Number(p && p.menge) || 1) > 1 ? (Number(p.menge) + " Stk \u00e0 " + round2(p.einzelpreis).toFixed(2) + " \u20ac") : ""].filter(Boolean).join(" \u00b7 ").slice(0, 150),
-        amount: round2((Number(p && p.menge) || 1) * (Number(p && p.einzelpreis) || 0)),
+        amount: (Number(p && p.betrag) > 0) ? round2(p.betrag) : round2((Number(p && p.menge) || 1) * (Number(p && p.einzelpreis) || 0)),
         vat_rate: VAT_NUM,
         category: KAT,
       }))

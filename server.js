@@ -10,7 +10,7 @@ app.use(papierkram);
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const MODEL = 'claude-sonnet-4-6';
-const BUILD = '2026-07-09-2';
+const BUILD = '2026-07-10-1';
 
 // Health-/Versions-Check: einfach https://huebner-dynamics-api.onrender.com/ im Browser oeffnen.
 // Zeigt, welches Modell und welcher Build gerade LIVE laufen.
@@ -121,11 +121,11 @@ WEITERE FELDER:
 - lieferant: Firmenname des Rechnungsstellers (z.B. "BALTZ Autoteile-Zubehör", "Emil Frey Vogel Automobile").
 - rechnungsnummer: die Rechnungs-Nr. (Re.Nr / Rechnungs-Nr.).
 - datum: Rechnungsdatum TT.MM.JJJJ.
-- positionen: JEDE Position mit artikelnummer (falls vorhanden), bezeichnung, menge (Zahl), einzelpreisNetto (Zahl, Punkt als Dezimaltrenner). Auch Pauschalen (z.B. Servicepauschale) und Versandkosten als Position aufnehmen; wenn nur ein Gesamtbetrag dasteht, menge 1 und diesen Betrag als einzelpreisNetto.
+- positionen: JEDE Position mit artikelnummer (falls vorhanden), bezeichnung, menge (Zahl), einzelpreisNetto (Zahl, Punkt als Dezimaltrenner) UND betragNetto: der TATSÄCHLICH BERECHNETE Netto-Positionsbetrag NACH Rabatt (rechte Spalte, z.B. "Gesamt-Netto Pr." bei Baltz oder "Betrag" bei Emil Frey). einzelpreisNetto = Liste vor Rabatt, betragNetto = wirklich bezahlt. Auch Pauschalen (z.B. Servicepauschale) und Versandkosten als Position aufnehmen; wenn nur ein Gesamtbetrag dasteht, menge 1 und diesen Betrag als einzelpreisNetto.
 - nettoGesamt, ustBetrag, brutto: die Summen unten auf der Rechnung (Zahlen).
 
 REGELN: Lies NUR, was dasteht. Unsichere Felder: leer bzw. 0. Antworte mit GENAU EINEM JSON-Objekt:
-{"lieferant":"","rechnungsnummer":"","datum":"","positionen":[{"artikelnummer":"","bezeichnung":"","menge":1,"einzelpreisNetto":0}],"nettoGesamt":0,"ustBetrag":0,"brutto":0}` },
+{"lieferant":"","rechnungsnummer":"","datum":"","positionen":[{"artikelnummer":"","bezeichnung":"","menge":1,"einzelpreisNetto":0,"betragNetto":0}],"nettoGesamt":0,"ustBetrag":0,"brutto":0}` },
         ],
       }],
     });
@@ -149,6 +149,7 @@ REGELN: Lies NUR, was dasteht. Unsichere Felder: leer bzw. 0. Antworte mit GENAU
         bezeichnung: String((x && x.bezeichnung) || '').trim(),
         menge: num(x && x.menge) || 1,
         einzelpreisNetto: num(x && x.einzelpreisNetto),
+        betragNetto: num(x && x.betragNetto),
       })).filter(x => x.bezeichnung),
       nettoGesamt: num(p.nettoGesamt),
       ustBetrag: num(p.ustBetrag),
