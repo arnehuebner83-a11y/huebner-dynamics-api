@@ -1,6 +1,8 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 10 — Beleg bucht BEZAHLTE Netto-Betraege (nach Rabatt); Rueckweg:
+// Version 11 — Beleg-Liste: NEUESTE zuerst (letzte Seite via total_pages);
+//               PDF-Download: URL-Felder des Dokumenteintrags zuerst pruefen,
+//               volle Diagnose bei Fehlschlag. Vorher: Version 10 — Beleg bucht BEZAHLTE Netto-Betraege (nach Rabatt); Rueckweg:
 //               Beleg-Liste + PDF-Download aus Papierkram. Vorher: Version 9 — PDF-Anhang-Fix: Multipart-Feld heisst "file" (aus Client-Quelltext
 //              verifiziert). Vorher: Version 8 — Kategorie-Fix: "Wareneingang" (gueltige Papierkram-Kategorie,
 //              "Wareneinkauf" existiert nicht). Vorher: Version 7 — Beleg-Fix: vat_rate als Zahl (0.19) laut API-Schema,
@@ -275,10 +277,22 @@ function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 
 // ── Rückweg: letzte Belege auflisten ──
 router.get("/api/beleg-liste", async (req, res) => {
-  const r = await pk("GET", "/expense/vouchers?page_size=20");
-  if (!r.ok) return res.status(502).json({ ok: false, status: r.status, papierkram: r.data });
-  const u = r.data || {};
-  const entries = u.entries || (u.data && u.data.entries) || [];
+  const first = await pk("GET", "/expense/vouchers?page_size=20");
+  if (!first.ok) return res.status(502).json({ ok: false, status: first.status, papierkram: first.data });
+  const u0 = first.data || {};
+  const totalPages = Number(u0.total_pages) || 1;
+  let entries = u0.entries || [];
+  if (totalPages > 1) {
+    const last = await pk("GET", "/expense/vouchers?page_size=20&page=" + totalPages);
+    entries = (last.ok && last.data && last.data.entries) || [];
+    if (entries.length < 20 && totalPages > 1) {
+      const prev = await pk("GET", "/expense/vouchers?page_size=20&page=" + (totalPages - 1));
+      const prevEntries = (prev.ok && prev.data && prev.data.entries) || [];
+      entries = prevEntries.concat(entries);
+    }
+  }
+  // Neueste zuerst, maximal 20
+  entries = entries.slice(-20).reverse();
   res.json({ ok: true, belege: entries.map(v => ({ id: v.id, name: v.name, voucher_no: v.voucher_no, document_date: v.document_date, amount: v.amount })) });
 });
 
@@ -305,8 +319,21 @@ router.get("/api/beleg-pdf/:id", async (req, res) => {
       const ab = await r2.arrayBuffer();
       return Buffer.from(ab).toString("base64");
     }
+    async function fetchUrl(url) {
+      const abs = url.indexOf("http") === 0 ? url : BASE.replace("/api/v1", "") + url;
+      const r5 = await fetch(abs, abs.indexOf(BASE) === 0 ? { headers: { "Authorization": "Bearer " + TOKEN } } : {});
+      return { r: r5, abs };
+    }
 
-    // Direkter Download-Versuch über die Dokument-Ressource
+    // 1) URL-Felder direkt am Dokumenteintrag (der Einzelabruf per ID liefert 404)
+    const entryUrl = first.url || first.file_url || first.download_url || (first.file && first.file.url) || (first.document && first.document.url) || first.path;
+    if (entryUrl) {
+      const { r: rE, abs } = await fetchUrl(entryUrl);
+      if (rE.ok) return res.json({ ok: true, pdfB64: await toB64(rE) });
+      return res.status(502).json({ ok: false, step: "entry_url_download", status: rE.status, url: abs, entry: first });
+    }
+
+    // 2) Letzter Versuch: Dokument-Ressource per ID (kann 404 sein)
     if (docId) {
       const r2 = await fetch(BASE + "/expense/vouchers/" + id + "/documents/" + docId, { headers: { "Authorization": "Bearer " + TOKEN } });
       const ct = (r2.headers.get("content-type") || "").toLowerCase();
@@ -324,17 +351,9 @@ router.get("/api/beleg-pdf/:id", async (req, res) => {
         }
         return res.status(502).json({ ok: false, step: "no_file_url", meta: m });
       }
-      return res.status(502).json({ ok: false, step: "document_get", status: r2.status });
+      return res.status(502).json({ ok: false, step: "document_get", status: r2.status, entry: first, hinweis: "Bitte diesen Fehler kopieren und schicken \u2013 der Eintrag zeigt die echten Feldnamen." });
     }
-    // Kein docId: vielleicht enthaelt der Eintrag selbst eine URL
-    const url0 = first.url || first.file_url || first.download_url;
-    if (url0) {
-      const abs = url0.indexOf("http") === 0 ? url0 : BASE.replace("/api/v1", "") + url0;
-      const r4 = await fetch(abs, abs.indexOf(BASE) === 0 ? { headers: { "Authorization": "Bearer " + TOKEN } } : {});
-      if (r4.ok) return res.json({ ok: true, pdfB64: await toB64(r4) });
-      return res.status(502).json({ ok: false, step: "entry_url_download", status: r4.status, url: abs });
-    }
-    return res.status(404).json({ ok: false, step: "no_document_id", list });
+    return res.status(404).json({ ok: false, step: "no_document_id_no_url", entry: first, hinweis: "Bitte diesen Fehler kopieren und schicken \u2013 der Eintrag zeigt die echten Feldnamen." });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
