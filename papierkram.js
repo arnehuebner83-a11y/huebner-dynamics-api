@@ -1,6 +1,7 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 11 — Beleg-Liste: NEUESTE zuerst (letzte Seite via total_pages);
+// Version 12 — Rechnungspositionen mit Menge (quantity aus teileMitPreisen.menge,
+//               Preis = Stueckpreis). Vorher: Version 11 — Beleg-Liste: NEUESTE zuerst (letzte Seite via total_pages);
 //               PDF-Download: URL-Felder des Dokumenteintrags zuerst pruefen,
 //               volle Diagnose bei Fehlschlag. Vorher: Version 10 — Beleg bucht BEZAHLTE Netto-Betraege (nach Rabatt); Rueckweg:
 //               Beleg-Liste + PDF-Download aus Papierkram. Vorher: Version 9 — PDF-Anhang-Fix: Multipart-Feld heisst "file" (aus Client-Quelltext
@@ -223,7 +224,7 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
     if (stunden > 0) lineItems.push({ name: labor.name, quantity: stunden, unit: labor.unit, price: labor.price, vat_rate: VAT });
     const mitPreisen = Array.isArray(b.teileMitPreisen) && b.teileMitPreisen.length ? b.teileMitPreisen : null;
     if (mitPreisen) {
-      mitPreisen.forEach(t => { const s = String((t && t.name) || "").trim(); if (s) lineItems.push({ name: s, quantity: 1, unit: "Stück", price: Number(t && t.preis) || 0, vat_rate: VAT }); });
+      mitPreisen.forEach(t => { const s = String((t && t.name) || "").trim(); if (s) lineItems.push({ name: s, quantity: Number(t && t.menge) || 1, unit: "Stück", price: Number(t && t.preis) || 0, vat_rate: VAT }); });
     } else {
       (b.teile || []).forEach(t => { const s = String(t || "").trim(); if (s) lineItems.push({ name: s, quantity: 1, unit: "Stück", price: 0, vat_rate: VAT }); });
     }
