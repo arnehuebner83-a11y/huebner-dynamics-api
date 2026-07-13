@@ -1,6 +1,8 @@
 // ============================================================================
 // papierkram.js  —  Papierkram-Anbindung für huebner-dynamics-api (Render)
-// Version 12 — Rechnungspositionen mit Menge (quantity aus teileMitPreisen.menge,
+// Version 14 — Arbeitsstunden-Position mit Beschreibung aus den Stunden-Texten
+//               (b.stundenTexte als Aufzaehlung). Vorher: Version 13 — PDF-Download: Feld 'uri' am Dokumenteintrag (aus Live-Diagnose),
+//               mit Auth-Retry. Vorher: Version 12 — Rechnungspositionen mit Menge (quantity aus teileMitPreisen.menge,
 //               Preis = Stueckpreis). Vorher: Version 11 — Beleg-Liste: NEUESTE zuerst (letzte Seite via total_pages);
 //               PDF-Download: URL-Felder des Dokumenteintrags zuerst pruefen,
 //               volle Diagnose bei Fehlschlag. Vorher: Version 10 — Beleg bucht BEZAHLTE Netto-Betraege (nach Rabatt); Rueckweg:
@@ -221,7 +223,12 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
     // Positionen: Arbeitsstunden (echter Preis aus Papierkram) + Teile (Preis 0, füllst du aus)
     const lineItems = [];
     const stunden = Number(b.stunden) || 0;
-    if (stunden > 0) lineItems.push({ name: labor.name, quantity: stunden, unit: labor.unit, price: labor.price, vat_rate: VAT });
+    if (stunden > 0) {
+      const li = { name: labor.name, quantity: stunden, unit: labor.unit, price: labor.price, vat_rate: VAT };
+      const texte = (Array.isArray(b.stundenTexte) ? b.stundenTexte : []).map(t => String(t || "").trim()).filter(Boolean);
+      if (texte.length) li.description = texte.map(t => "\u2022 " + t).join("\n");
+      lineItems.push(li);
+    }
     const mitPreisen = Array.isArray(b.teileMitPreisen) && b.teileMitPreisen.length ? b.teileMitPreisen : null;
     if (mitPreisen) {
       mitPreisen.forEach(t => { const s = String((t && t.name) || "").trim(); if (s) lineItems.push({ name: s, quantity: Number(t && t.menge) || 1, unit: "Stück", price: Number(t && t.preis) || 0, vat_rate: VAT }); });
@@ -322,12 +329,16 @@ router.get("/api/beleg-pdf/:id", async (req, res) => {
     }
     async function fetchUrl(url) {
       const abs = url.indexOf("http") === 0 ? url : BASE.replace("/api/v1", "") + url;
-      const r5 = await fetch(abs, abs.indexOf(BASE) === 0 ? { headers: { "Authorization": "Bearer " + TOKEN } } : {});
+      // Erst ohne Auth (signierte Anhang-URLs), bei Ablehnung mit Bearer erneut
+      let r5 = await fetch(abs);
+      if (!r5.ok && (r5.status === 401 || r5.status === 403)) {
+        r5 = await fetch(abs, { headers: { "Authorization": "Bearer " + TOKEN } });
+      }
       return { r: r5, abs };
     }
 
     // 1) URL-Felder direkt am Dokumenteintrag (der Einzelabruf per ID liefert 404)
-    const entryUrl = first.url || first.file_url || first.download_url || (first.file && first.file.url) || (first.document && first.document.url) || first.path;
+    const entryUrl = first.uri || first.url || first.file_url || first.download_url || (first.file && first.file.url) || (first.document && first.document.url) || first.path;
     if (entryUrl) {
       const { r: rE, abs } = await fetchUrl(entryUrl);
       if (rE.ok) return res.json({ ok: true, pdfB64: await toB64(rE) });
