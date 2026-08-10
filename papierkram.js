@@ -206,7 +206,10 @@ async function findOrCreateContact(name, adr) {
 //    Frontend schickt: { kennzeichen, halter, leistungVon, leistungBis,
 //                        rechnungsdatum, stunden, teile: [...] }
 // ============================================================================
-router.post("/api/papierkram-rechnung", async (req, res) => {
+router.post("/api/papierkram-rechnung", (req, res) => rechnungHandler(req, res, null));
+router.put("/api/papierkram-rechnung/:id", (req, res) => rechnungHandler(req, res, req.params.id));
+
+async function rechnungHandler(req, res, updateId) {
   try {
     if (!TOKEN) return res.status(500).json({ ok: false, msg: "PAPIERKRAM_TOKEN fehlt (Render Environment)" });
     const b = req.body || {};
@@ -249,14 +252,31 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
       line_items: lineItems,
     };
 
-    const inv = await pk("POST", "/income/invoices", body);
-    if (!inv.ok) {
-      return res.status(502).json({ ok: false, step: "invoice_create", status: inv.status, sent: body, papierkram: inv.data });
+    let inv;
+    if (updateId) {
+      inv = await pk("PATCH", "/income/invoices/" + updateId, body);
+      if (!inv.ok && (inv.status === 404 || inv.status === 405)) {
+        inv = await pk("PUT", "/income/invoices/" + updateId, body);
+      }
+      if (!inv.ok) {
+        const hint = inv.status === 404
+          ? "Rechnung " + updateId + " nicht gefunden \u2013 evtl. in Papierkram gel\u00f6scht. Bitte neu anlegen."
+          : (inv.status === 422 || inv.status === 403)
+            ? "Papierkram l\u00e4sst diese Rechnung nicht mehr \u00e4ndern \u2013 vermutlich ist sie bereits festgeschrieben oder versendet. In Papierkram wieder in den Entwurf zur\u00fccksetzen oder eine neue Rechnung anlegen."
+            : "\u00c4nderung abgelehnt (HTTP " + inv.status + ").";
+        return res.status(502).json({ ok: false, step: "invoice_update", status: inv.status, msg: hint, sent: body, papierkram: inv.data });
+      }
+    } else {
+      inv = await pk("POST", "/income/invoices", body);
+      if (!inv.ok) {
+        return res.status(502).json({ ok: false, step: "invoice_create", status: inv.status, sent: body, papierkram: inv.data });
+      }
     }
     const d = unwrap(inv.data);
     return res.json({
       ok: true,
-      invoiceId: d.id || null,
+      updated: !!updateId,
+      invoiceId: d.id || updateId || null,
       contactCreated: !!contact.created,
       contactName: contact.name,
       laborUsed: labor.name + " (" + labor.price + " \u20AC/" + labor.unit + ")",
@@ -267,7 +287,7 @@ router.post("/api/papierkram-rechnung", async (req, res) => {
   } catch (e) {
     return res.status(500).json({ ok: false, msg: "Serverfehler", detail: String(e) });
   }
-});
+}
 
 // ── Beleg-Import: rein lesende Diagnose (Schema vorhandener Belege ansehen) ──
 router.get("/api/voucher-inspect", async (req, res) => {
