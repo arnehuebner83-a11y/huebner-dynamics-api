@@ -10,7 +10,7 @@ app.use(papierkram);
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const MODEL = 'claude-sonnet-4-6';
-const BUILD = '2026-07-10-1';
+const BUILD = '2026-09-15-1';
 
 // Health-/Versions-Check: einfach https://huebner-dynamics-api.onrender.com/ im Browser oeffnen.
 // Zeigt, welches Modell und welcher Build gerade LIVE laufen.
@@ -155,6 +155,62 @@ REGELN: Lies NUR, was dasteht. Unsichere Felder: leer bzw. 0. Antworte mit GENAU
       ustBetrag: num(p.ustBetrag),
       brutto: num(p.brutto),
     });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/befunde-aus-text', async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || !String(text).trim()) throw new Error('Kein Text vorhanden');
+
+    const response = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2000,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: `Du hilfst einem Kfz-Meister bei der Fahrzeugannahme. Er diktiert den Eingangszustand eines Fahrzeugs in einem Rutsch. Der Text kommt aus einer Spracherkennung und enthält daher Versprecher, fehlende Satzzeichen und Transkriptionsfehler.
+
+DEINE AUFGABE: Zerlege den Text in EINZELNE Befunde - ein Befund je festgestellter Schwachstelle.
+
+REGELN:
+- Formuliere jeden Befund als kurzen, sachlichen Satz in Werkstattsprache, so wie ein Meister ihn aufschreiben würde. Beispiel: aus "also die bremsen vorne sind auch runter so gut wie" wird "Bremsbeläge vorne verschlissen".
+- Erfinde NICHTS. Nur das, was wirklich gesagt wurde. Im Zweifel den Wortlaut näher am Original lassen.
+- Korrigiere offensichtliche Erkennungsfehler bei Kfz-Fachbegriffen: "Panelstützen"/"Pendelstützen", "Domlager", "Querlenker", "Spurstangenkopf", "Zahnriemen", "Traggelenk", "Hardyscheibe", "Achsmanschette", "Bremssattel".
+- typ: "empfehlung" wenn etwas gemacht werden sollte (Verschleiß, Defekt, Undichtigkeit). "hinweis" wenn es nur eine Feststellung zur Kenntnis ist (Kratzer, Vorschaden, Zustand allgemein).
+- Allgemeine Vorreden ("also ich schau mir das mal an", "so, Fahrzeug steht auf der Bühne") sind KEIN Befund und werden weggelassen.
+- Fasse zusammengehörende Aussagen zu EINEM Befund zusammen, statt sie zu zerreißen.
+- Reihenfolge wie im Diktat.
+
+Antworte mit GENAU EINEM JSON-Objekt, ohne Vorrede, ohne Markdown:
+{"befunde":[{"text":"","typ":"empfehlung"}]}
+
+Hier das Diktat:
+---
+` + String(text).slice(0, 8000) + `
+---` },
+        ],
+      }],
+    });
+
+    const raw = response.content?.[0]?.text || '';
+    let p = {};
+    try {
+      const m = raw.match(/\{[\s\S]*\}/);
+      p = m ? JSON.parse(m[0]) : {};
+    } catch (e) { p = {}; }
+
+    const liste = (Array.isArray(p.befunde) ? p.befunde : [])
+      .map(x => ({
+        text: String((x && x.text) || '').trim(),
+        typ: (x && x.typ) === 'hinweis' ? 'hinweis' : 'empfehlung',
+      }))
+      .filter(x => x.text)
+      .slice(0, 40);
+
+    res.json({ success: true, build: BUILD, befunde: liste });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
