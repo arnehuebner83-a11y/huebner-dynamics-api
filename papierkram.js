@@ -68,9 +68,39 @@ function asList(d) {
 function unwrap(d) { return (d && d.entry) ? d.entry : (d || {}); }
 
 // Namens-Abgleich: klein, Wörter sortiert → "Palzer Michael" == "Michael Palzer"
+// Rechtsformen und Anreden, die beim Vergleich nichts zur Sache tun
+const NAME_FUELL = ["gmbh", "mbh", "ug", "ag", "kg", "ohg", "gbr", "ek", "co", "haftungsbeschraenkt",
+                    "herr", "frau", "hr", "fr", "firma", "fa"];
+
+// "Rössig" -> "roessig", "Anne-Marie" -> "anne marie", "José" -> "jose"
+function nameNorm(s) {
+  return (s == null ? "" : String(s))
+    .toLowerCase()
+    .replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue").replace(/ß/g, "ss")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[.,;:()\/\-_&+]/g, " ");
+}
+
+// Wortmenge ohne Fuellwoerter, sortiert – Reihenfolge egal
+function nameWorte(s) {
+  return nameNorm(s).split(/\s+/).filter(Boolean).filter(w => NAME_FUELL.indexOf(w) < 0);
+}
+
 function nameKey(s) {
-  return (s == null ? "" : String(s)).toLowerCase().replace(/[.,]/g, " ")
-    .split(/\s+/).filter(Boolean).sort().join(" ");
+  return nameWorte(s).slice().sort().join(" ");
+}
+
+// Ist die kuerzere Wortmenge vollstaendig in der laengeren enthalten?
+// Beispiel: "Rössig Kai" steckt in "Philipp Kai Rössig" -> wahrscheinlich derselbe Kunde.
+// Mindestens 2 gemeinsame Woerter, sonst wuerde jeder "Müller" auf jeden anderen passen.
+function nameTeilmenge(a, b) {
+  const wa = nameWorte(a), wb = nameWorte(b);
+  if (!wa.length || !wb.length) return false;
+  const kurz = wa.length <= wb.length ? wa : wb;
+  const lang = wa.length <= wb.length ? wb : wa;
+  if (kurz.length < 2) return false;
+  if (kurz.length === lang.length) return false;
+  return kurz.every(w => lang.indexOf(w) >= 0);
 }
 
 // ISO (JJJJ-MM-TT) → TT.MM.JJJJ (für den Beschreibungstext)
@@ -147,31 +177,56 @@ async function ensureCustomer(company) {
 }
 
 // ── Bestandskunde suchen (Unternehmen-Kontakte, Wortreihenfolge egal) ───────
+// Liefert { exact } bei sicherem Treffer, sonst { unsicher: [...] }, sonst null
 async function findContact(name) {
   const target = nameKey(name);
   if (!target) return null;
-  for (let page = 1; page <= 10; page++) {
+  const unsicher = [];
+  for (let page = 1; page <= 20; page++) {
     const r = await pk("GET", "/contact/companies?page=" + page + "&page_size=100");
     if (!r.ok) return { httpError: { step: "contact_search", status: r.status, papierkram: r.data } };
     const list = asList(r.data);
     if (!list.length) break;
     const hit = list.find(c => nameKey(c.name) === target);
-    if (hit) return hit;
+    if (hit) return { exact: hit };
+    list.forEach(c => {
+      if (nameTeilmenge(name, c.name) && !unsicher.some(x => x.id === c.id))
+        unsicher.push({ id: c.id, name: c.name, contact_type: c.contact_type });
+    });
     if (list.length < 100) break;
   }
-  return null;
+  return unsicher.length ? { unsicher: unsicher.slice(0, 6) } : null;
 }
 
-async function findOrCreateContact(name, adr) {
+// contactId: vom Frontend bestaetigte Auswahl – dann wird nicht mehr gesucht.
+// neuAnlegen: true = Rueckfrage mit "Neu anlegen" beantwortet.
+async function findOrCreateContact(name, adr, wahl) {
   const clean = (name || "").trim();
   if (!clean) return { error: { step: "contact", msg: "Kein Halter-Name übergeben (Fahrzeugschein hatte keinen)" } };
+  const w = wahl || {};
+
+  // Der Nutzer hat einen vorhandenen Kunden bestaetigt
+  if (w.contactId) {
+    const g = await pk("GET", "/contact/companies/" + w.contactId);
+    if (!g.ok) return { error: { step: "contact", status: g.status, msg: "Ausgewählter Kunde nicht mehr gefunden (ID " + w.contactId + ")", papierkram: g.data } };
+    const d = unwrap(g.data);
+    const ens = await ensureCustomer({ id: d.id, name: d.name, contact_type: d.contact_type });
+    if (ens.needsManual) return { error: { step: "contact_type", msg: "Kontakt \"" + d.name + "\" (ID " + d.id + ") ist nicht als KUNDE typisiert und ließ sich per API nicht umstellen." } };
+    return { id: ens.id || d.id, name: ens.name || d.name, created: false };
+  }
 
   const found = await findContact(clean);
   if (found && found.httpError) return { error: found.httpError };
 
+  // Aehnliche Namen gefunden, aber nicht eindeutig -> nicht raten, sondern fragen
+  if (found && found.unsicher && !w.neuAnlegen) {
+    return { needsChoice: { gesucht: clean, kandidaten: found.unsicher } };
+  }
+
   let company = null, created = false;
-  if (found) {
-    company = { id: found.id, name: found.name, contact_type: found.contact_type };
+  const treffer = (found && found.exact) || null;
+  if (treffer) {
+    company = { id: treffer.id, name: treffer.name, contact_type: treffer.contact_type };
   } else {
     if (!AUTOCREATE) return { error: { step: "contact", msg: "Kunde \"" + clean + "\" nicht gefunden – bitte in Papierkram anlegen (Auto-Anlegen ist aus)" } };
     const createBody = { name: clean, contact_type: "customer" };
@@ -220,7 +275,10 @@ async function rechnungHandler(req, res, updateId) {
     const payterm = await getPaymentTerm();
     if (payterm.error) return res.status(502).json({ ok: false, ...payterm.error });
 
-    const contact = await findOrCreateContact(b.halter, { street: String(b.strasse || "").trim(), zip: String(b.plz || "").trim(), city: String(b.ort || "").trim() });
+    const contact = await findOrCreateContact(b.halter,
+      { street: String(b.strasse || "").trim(), zip: String(b.plz || "").trim(), city: String(b.ort || "").trim() },
+      { contactId: b.contactId, neuAnlegen: !!b.neuerKunde });
+    if (contact.needsChoice) return res.status(409).json({ ok: false, needsChoice: contact.needsChoice });
     if (contact.error) return res.status(502).json({ ok: false, ...contact.error });
 
     // Positionen: Arbeitsstunden (echter Preis aus Papierkram) + Teile (Preis 0, füllst du aus)
@@ -288,6 +346,97 @@ async function rechnungHandler(req, res, updateId) {
     return res.status(500).json({ ok: false, msg: "Serverfehler", detail: String(e) });
   }
 }
+
+// ============================================================================
+// 2b) ANGEBOT / KOSTENVORANSCHLAG ANLEGEN
+//     Frontend schickt: { kennzeichen, halter, strasse, plz, ort, datum,
+//                         positionen: [{ text, menge, preis, einheit }],  <- preis BRUTTO
+//                         hinweis, contactId?, neuerKunde? }
+// ============================================================================
+router.post("/api/papierkram-angebot", async (req, res) => {
+  try {
+    if (!TOKEN) return res.status(500).json({ ok: false, msg: "PAPIERKRAM_TOKEN fehlt (Render Environment)" });
+    const b = req.body || {};
+
+    const contact = await findOrCreateContact(b.halter,
+      { street: String(b.strasse || "").trim(), zip: String(b.plz || "").trim(), city: String(b.ort || "").trim() },
+      { contactId: b.contactId, neuAnlegen: !!b.neuerKunde });
+    if (contact.needsChoice) return res.status(409).json({ ok: false, needsChoice: contact.needsChoice });
+    if (contact.error) return res.status(502).json({ ok: false, ...contact.error });
+
+    // Die App rechnet in BRUTTO, Papierkram will den Nettopreis je Einheit
+    const lineItems = [];
+    (Array.isArray(b.positionen) ? b.positionen : []).forEach(p => {
+      const text = String((p && p.text) || "").trim();
+      if (!text) return;
+      const menge = Number(p && p.menge) || 0;
+      const brutto = Number(p && p.preis) || 0;
+      const netto = Math.round((brutto / (1 + VAT)) * 100) / 100;
+      lineItems.push({
+        name: text,
+        quantity: menge,
+        unit: (p && p.einheit === "h") ? "Stunde" : "Stück",
+        price: netto,
+        vat_rate: VAT,
+      });
+    });
+    if (!lineItems.length) return res.status(400).json({ ok: false, msg: "Keine Positionen – das Angebot wäre leer." });
+
+    const heute = new Date();
+    const iso = d => d.getFullYear() + "-" + ("0" + (d.getMonth() + 1)).slice(-2) + "-" + ("0" + d.getDate()).slice(-2);
+    const body = {
+      name: b.kennzeichen || "Kostenvoranschlag",
+      document_date: b.datum || iso(heute),
+      customer: { id: contact.id },
+      line_items: lineItems,
+    };
+    const hinweis = String(b.hinweis || "").trim();
+    if (hinweis) body.description = hinweis;
+
+    let est = await pk("POST", "/income/estimates", body);
+    if (!est.ok) {
+      return res.status(502).json({
+        ok: false, step: "estimate_create", status: est.status,
+        msg: est.status === 404
+          ? "Papierkram kennt /income/estimates nicht – bitte /api/angebot-inspect aufrufen und das Ergebnis schicken."
+          : "Angebot abgelehnt (HTTP " + est.status + ").",
+        sent: body, papierkram: est.data,
+      });
+    }
+    const d = unwrap(est.data);
+    return res.json({
+      ok: true,
+      estimateId: d.id || null,
+      contactCreated: !!contact.created,
+      contactName: contact.name,
+      url: `https://${SUB}.papierkram.de/`,
+      papierkram: d,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, msg: "Serverfehler", detail: String(e) });
+  }
+});
+
+// ── Angebote: rein lesende Diagnose (Schema vorhandener Angebote ansehen) ───
+router.get("/api/angebot-inspect", async (req, res) => {
+  if (!TOKEN) return res.status(500).json({ ok: false, msg: "PAPIERKRAM_TOKEN fehlt" });
+  const r = await pk("GET", "/income/estimates?page_size=3");
+  res.json({ ok: r.ok, status: r.status, papierkram: r.data });
+});
+
+// ── Kundensuche: was findet der Abgleich zu einem Namen? ────────────────────
+router.get("/api/kunde-pruefen", async (req, res) => {
+  if (!TOKEN) return res.status(500).json({ ok: false, msg: "PAPIERKRAM_TOKEN fehlt" });
+  const name = String(req.query.name || "").trim();
+  if (!name) return res.status(400).json({ ok: false, msg: "Parameter ?name= fehlt" });
+  const f = await findContact(name);
+  if (f && f.httpError) return res.status(502).json({ ok: false, ...f.httpError });
+  res.json({
+    ok: true, gesucht: name, schluessel: nameKey(name),
+    treffer: (f && f.exact) ? { id: f.exact.id, name: f.exact.name } : null,
+    unsicher: (f && f.unsicher) || [],
+  });
+});
 
 // ── Beleg-Import: rein lesende Diagnose (Schema vorhandener Belege ansehen) ──
 router.get("/api/voucher-inspect", async (req, res) => {
