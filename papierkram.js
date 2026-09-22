@@ -37,6 +37,14 @@ const SUB = process.env.PAPIERKRAM_SUBDOMAIN || "hbnerdynamics";
 const LABOR_ID = process.env.PAPIERKRAM_LABOR_ID || "";
 const PAYTERM_ID = process.env.PAPIERKRAM_PAYMENT_TERM_ID || "";
 const VAT = process.env.PAPIERKRAM_VAT || "19%";
+// VAT ist ein Anzeigewert ("19%"). Zum RECHNEN braucht es eine Zahl:
+// "19%" -> 0.19, "19" -> 0.19, "0.19" -> 0.19
+const VAT_FAKTOR = (() => {
+  const m = /([\d]+(?:[.,][\d]+)?)/.exec(String(VAT));
+  let n = m ? parseFloat(m[1].replace(",", ".")) : 19;
+  if (!isFinite(n) || n < 0) n = 19;
+  return n > 1 ? n / 100 : n;
+})();
 const AUTOCREATE = String(process.env.PAPIERKRAM_AUTOCREATE_CONTACT || "true") !== "false";
 const BASE = `https://${SUB}.papierkram.de/api/v1`;
 
@@ -395,10 +403,11 @@ router.post("/api/papierkram-angebot", async (req, res) => {
       if (!text) return;
       const menge = Number(p && p.menge) || 0;
       const brutto = Number(p && p.preis) || 0;
-      const netto = Math.round((brutto / (1 + VAT)) * 100) / 100;
+      let netto = Math.round((brutto / (1 + VAT_FAKTOR)) * 100) / 100;
+      if (!isFinite(netto)) netto = 0;   // nie null an Papierkram schicken
       lineItems.push({
         name: text,
-        quantity: menge,
+        quantity: isFinite(menge) ? menge : 0,
         unit: (p && p.einheit === "h") ? stundenEinheit : "Stück",
         price: netto,
         vat_rate: VAT,
