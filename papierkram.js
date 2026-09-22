@@ -86,6 +86,24 @@ function nameWorte(s) {
   return nameNorm(s).split(/\s+/).filter(Boolean).filter(w => NAME_FUELL.indexOf(w) < 0);
 }
 
+// Papierkram-Fehlerobjekt zu einem lesbaren Satz eindampfen
+function kurzFehler(d) {
+  if (!d) return "keine Angabe";
+  if (typeof d === "string") return d.slice(0, 300);
+  const teile = [];
+  const sammle = (obj, pfad) => {
+    if (obj == null) return;
+    if (Array.isArray(obj)) { obj.forEach(x => sammle(x, pfad)); return; }
+    if (typeof obj === "object") {
+      Object.keys(obj).forEach(k => sammle(obj[k], pfad ? pfad + "." + k : k));
+      return;
+    }
+    teile.push((pfad ? pfad + ": " : "") + String(obj));
+  };
+  sammle(d.errors || d.error || d, "");
+  return teile.length ? teile.slice(0, 6).join(" | ").slice(0, 400) : JSON.stringify(d).slice(0, 300);
+}
+
 function nameKey(s) {
   return nameWorte(s).slice().sort().join(" ");
 }
@@ -384,12 +402,17 @@ router.post("/api/papierkram-angebot", async (req, res) => {
 
     const heute = new Date();
     const iso = d => d.getFullYear() + "-" + ("0" + (d.getMonth() + 1)).slice(-2) + "-" + ("0" + d.getDate()).slice(-2);
+    const gueltigBis = new Date(heute.getTime() + 30 * 86400000);
     const body = {
       name: b.kennzeichen || "Kostenvoranschlag",
       document_date: b.datum || iso(heute),
+      valid_until: b.gueltigBis || iso(gueltigBis),
       customer: { id: contact.id },
       line_items: lineItems,
     };
+    // Rechnungen brauchen eine Zahlungsbedingung – Angebote vermutlich auch
+    const pt = await getPaymentTerm();
+    if (!pt.error) body.payment_term = { id: pt.id };
     const hinweis = String(b.hinweis || "").trim();
     if (hinweis) body.description = hinweis;
 
@@ -399,7 +422,7 @@ router.post("/api/papierkram-angebot", async (req, res) => {
         ok: false, step: "estimate_create", status: est.status,
         msg: est.status === 404
           ? "Papierkram kennt /income/estimates nicht – bitte /api/angebot-inspect aufrufen und das Ergebnis schicken."
-          : "Angebot abgelehnt (HTTP " + est.status + ").",
+          : "Angebot abgelehnt (HTTP " + est.status + "): " + kurzFehler(est.data),
         sent: body, papierkram: est.data,
       });
     }
@@ -411,6 +434,78 @@ router.post("/api/papierkram-angebot", async (req, res) => {
       contactName: contact.name,
       url: `https://${SUB}.papierkram.de/`,
       papierkram: d,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, msg: "Serverfehler", detail: String(e) });
+  }
+});
+
+// ── Angebot-Selbsttest: probiert Strukturvarianten und meldet, welche geht ──
+//    Erfolgreiche Testangebote werden sofort wieder geloescht.
+router.get("/api/angebot-test", async (req, res) => {
+  if (!TOKEN) return res.status(500).json({ ok: false, msg: "PAPIERKRAM_TOKEN fehlt" });
+  try {
+    // Einen vorhandenen Kunden nehmen, damit die Kundenanlage nicht stoert
+    const kl = await pk("GET", "/contact/companies?page_size=100");
+    if (!kl.ok) return res.status(502).json({ ok: false, step: "kundenliste", status: kl.status, papierkram: kl.data });
+    const kunden = asList(kl.data).filter(c => (c.contact_type || "") === "customer");
+    if (!kunden.length) return res.status(400).json({ ok: false, msg: "Kein Kontakt vom Typ \"customer\" gefunden – bitte in Papierkram einen Kunden anlegen." });
+    const kunde = kunden[0];
+
+    const heute = new Date();
+    const iso = d => d.getFullYear() + "-" + ("0" + (d.getMonth() + 1)).slice(-2) + "-" + ("0" + d.getDate()).slice(-2);
+    const in30 = iso(new Date(heute.getTime() + 30 * 86400000));
+    const pt = await getPaymentTerm();
+    const ptId = pt && !pt.error ? pt.id : null;
+    const posMin = [{ name: "Testposition", quantity: 1, unit: "Stück", price: 100, vat_rate: VAT }];
+
+    const varianten = [
+      { was: "minimal (name, document_date, customer, line_items)",
+        body: { name: "SELBSTTEST", document_date: iso(heute), customer: { id: kunde.id }, line_items: posMin } },
+      { was: "+ payment_term",
+        body: { name: "SELBSTTEST", document_date: iso(heute), customer: { id: kunde.id }, line_items: posMin, payment_term: ptId ? { id: ptId } : undefined } },
+      { was: "+ valid_until",
+        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: posMin } },
+      { was: "+ payment_term + valid_until",
+        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: posMin, payment_term: ptId ? { id: ptId } : undefined } },
+      { was: "customer_id statt customer-Objekt",
+        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer_id: kunde.id, line_items: posMin } },
+      { was: "contact statt customer",
+        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, contact: { id: kunde.id }, line_items: posMin } },
+      { was: "vat_rate als ganze Zahl (19)",
+        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: [{ name: "Testposition", quantity: 1, unit: "Stück", price: 100, vat_rate: 19 }] } },
+      { was: "line_items ohne unit",
+        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: [{ name: "Testposition", quantity: 1, price: 100, vat_rate: VAT }] } },
+      { was: "in estimate eingepackt",
+        body: { estimate: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: posMin } } },
+    ];
+
+    const protokoll = [];
+    let gewinner = null;
+    for (let i = 0; i < varianten.length; i++) {
+      const v = varianten[i];
+      const clean = JSON.parse(JSON.stringify(v.body)); // undefined-Felder entfernen
+      const r = await pk("POST", "/income/estimates", clean);
+      protokoll.push({ variante: v.was, status: r.status, ok: r.ok, antwort: r.ok ? "angelegt" : r.data });
+      if (r.ok) {
+        const d = unwrap(r.data);
+        gewinner = { variante: v.was, gesendet: clean, id: d.id || null };
+        // Testangebot sofort wieder entfernen
+        if (d.id) {
+          const del = await pk("DELETE", "/income/estimates/" + d.id);
+          gewinner.wiederGeloescht = !!del.ok;
+          if (!del.ok) gewinner.loeschHinweis = "Konnte nicht geloescht werden (HTTP " + del.status + ") – bitte in Papierkram das Angebot \"SELBSTTEST\" von Hand loeschen.";
+        }
+        break;
+      }
+    }
+    return res.json({
+      ok: !!gewinner,
+      kundeBenutzt: kunde.name,
+      zahlungsbedingung: ptId,
+      gewinner: gewinner,
+      hinweis: gewinner ? "Diese Variante funktioniert – bitte an Claude schicken." : "Keine Variante akzeptiert. Das vollstaendige Protokoll unten an Claude schicken.",
+      protokoll: protokoll,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, msg: "Serverfehler", detail: String(e) });
