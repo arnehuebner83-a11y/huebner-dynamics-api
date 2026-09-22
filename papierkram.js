@@ -382,6 +382,12 @@ router.post("/api/papierkram-angebot", async (req, res) => {
     if (contact.needsChoice) return res.status(409).json({ ok: false, needsChoice: contact.needsChoice });
     if (contact.error) return res.status(502).json({ ok: false, ...contact.error });
 
+    // Einheit fuer Arbeitszeit aus Papierkram holen – ein frei erfundener
+    // Einheitenname wird sonst abgelehnt (Rechnung macht es genauso).
+    let stundenEinheit = "Stück";
+    const labor = await getLabor();
+    if (!labor.error && labor.unit) stundenEinheit = labor.unit;
+
     // Die App rechnet in BRUTTO, Papierkram will den Nettopreis je Einheit
     const lineItems = [];
     (Array.isArray(b.positionen) ? b.positionen : []).forEach(p => {
@@ -393,7 +399,7 @@ router.post("/api/papierkram-angebot", async (req, res) => {
       lineItems.push({
         name: text,
         quantity: menge,
-        unit: (p && p.einheit === "h") ? "Stunde" : "Stück",
+        unit: (p && p.einheit === "h") ? stundenEinheit : "Stück",
         price: netto,
         vat_rate: VAT,
       });
@@ -402,17 +408,14 @@ router.post("/api/papierkram-angebot", async (req, res) => {
 
     const heute = new Date();
     const iso = d => d.getFullYear() + "-" + ("0" + (d.getMonth() + 1)).slice(-2) + "-" + ("0" + d.getDate()).slice(-2);
-    const gueltigBis = new Date(heute.getTime() + 30 * 86400000);
+    // Bewiesen per /api/angebot-test: diese Minimalstruktur akzeptiert Papierkram.
+    // payment_term und valid_until sind NICHT noetig und wurden wieder entfernt.
     const body = {
       name: b.kennzeichen || "Kostenvoranschlag",
       document_date: b.datum || iso(heute),
-      valid_until: b.gueltigBis || iso(gueltigBis),
       customer: { id: contact.id },
       line_items: lineItems,
     };
-    // Rechnungen brauchen eine Zahlungsbedingung – Angebote vermutlich auch
-    const pt = await getPaymentTerm();
-    if (!pt.error) body.payment_term = { id: pt.id };
     const hinweis = String(b.hinweis || "").trim();
     if (hinweis) body.description = hinweis;
 
@@ -457,55 +460,57 @@ router.get("/api/angebot-test", async (req, res) => {
     const in30 = iso(new Date(heute.getTime() + 30 * 86400000));
     const pt = await getPaymentTerm();
     const ptId = pt && !pt.error ? pt.id : null;
-    const posMin = [{ name: "Testposition", quantity: 1, unit: "Stück", price: 100, vat_rate: VAT }];
+    const laborInfo = await getLabor();
+
+    // Auf der bewiesenen Minimalstruktur aufbauen und einzeln ergaenzen,
+    // damit klar wird, WELCHE Zutat Papierkram stoert.
+    const basis = () => ({ name: "SELBSTTEST", document_date: iso(heute), customer: { id: kunde.id },
+                           line_items: [{ name: "Testposition", quantity: 1, unit: "Stück", price: 100, vat_rate: VAT }] });
+    const mit = (was, aender) => { const b = basis(); aender(b); return { was: was, body: b }; };
+    const laborEinheit = (() => { const l = laborInfo; return (l && !l.error && l.unit) ? l.unit : null; })();
 
     const varianten = [
-      { was: "minimal (name, document_date, customer, line_items)",
-        body: { name: "SELBSTTEST", document_date: iso(heute), customer: { id: kunde.id }, line_items: posMin } },
-      { was: "+ payment_term",
-        body: { name: "SELBSTTEST", document_date: iso(heute), customer: { id: kunde.id }, line_items: posMin, payment_term: ptId ? { id: ptId } : undefined } },
-      { was: "+ valid_until",
-        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: posMin } },
-      { was: "+ payment_term + valid_until",
-        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: posMin, payment_term: ptId ? { id: ptId } : undefined } },
-      { was: "customer_id statt customer-Objekt",
-        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer_id: kunde.id, line_items: posMin } },
-      { was: "contact statt customer",
-        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, contact: { id: kunde.id }, line_items: posMin } },
-      { was: "vat_rate als ganze Zahl (19)",
-        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: [{ name: "Testposition", quantity: 1, unit: "Stück", price: 100, vat_rate: 19 }] } },
-      { was: "line_items ohne unit",
-        body: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: [{ name: "Testposition", quantity: 1, price: 100, vat_rate: VAT }] } },
-      { was: "in estimate eingepackt",
-        body: { estimate: { name: "SELBSTTEST", document_date: iso(heute), valid_until: in30, customer: { id: kunde.id }, line_items: posMin } } },
+      { was: "Minimal (Referenz)", body: basis() },
+      mit("+ description", b => { b.description = "Hinweistext"; }),
+      mit("+ valid_until", b => { b.valid_until = in30; }),
+      mit("+ payment_term", b => { if (ptId) b.payment_term = { id: ptId }; }),
+      mit("Einheit \"Stunde\" (hart)", b => { b.line_items[0].unit = "Stunde"; }),
+      mit("Einheit aus Papierkram (" + (laborEinheit || "keine") + ")", b => { if (laborEinheit) b.line_items[0].unit = laborEinheit; }),
+      mit("Preis 0", b => { b.line_items[0].price = 0; }),
+      mit("Menge mit Nachkommastelle (3,5)", b => { b.line_items[0].quantity = 3.5; }),
+      mit("Position ohne unit", b => { delete b.line_items[0].unit; }),
+      mit("zwei Positionen, eine mit Preis 0", b => { b.line_items.push({ name: "Teil ohne Preis", quantity: 2, unit: "Stück", price: 0, vat_rate: VAT }); }),
     ];
 
+    // ALLE Varianten durchlaufen – nur so sieht man, welche Zutat stoert
     const protokoll = [];
-    let gewinner = null;
+    const nichtGeloescht = [];
     for (let i = 0; i < varianten.length; i++) {
       const v = varianten[i];
-      const clean = JSON.parse(JSON.stringify(v.body)); // undefined-Felder entfernen
+      const clean = JSON.parse(JSON.stringify(v.body));
       const r = await pk("POST", "/income/estimates", clean);
-      protokoll.push({ variante: v.was, status: r.status, ok: r.ok, antwort: r.ok ? "angelegt" : r.data });
+      const zeile = { variante: v.was, status: r.status, geht: !!r.ok };
+      if (!r.ok) zeile.warum = kurzFehler(r.data);
+      protokoll.push(zeile);
       if (r.ok) {
         const d = unwrap(r.data);
-        gewinner = { variante: v.was, gesendet: clean, id: d.id || null };
-        // Testangebot sofort wieder entfernen
         if (d.id) {
           const del = await pk("DELETE", "/income/estimates/" + d.id);
-          gewinner.wiederGeloescht = !!del.ok;
-          if (!del.ok) gewinner.loeschHinweis = "Konnte nicht geloescht werden (HTTP " + del.status + ") – bitte in Papierkram das Angebot \"SELBSTTEST\" von Hand loeschen.";
+          if (!del.ok) nichtGeloescht.push(d.id);
         }
-        break;
       }
     }
+    const fehler = protokoll.filter(p => !p.geht);
     return res.json({
-      ok: !!gewinner,
+      ok: fehler.length === 0,
       kundeBenutzt: kunde.name,
+      einheitAusPapierkram: laborEinheit,
       zahlungsbedingung: ptId,
-      gewinner: gewinner,
-      hinweis: gewinner ? "Diese Variante funktioniert – bitte an Claude schicken." : "Keine Variante akzeptiert. Das vollstaendige Protokoll unten an Claude schicken.",
+      zusammenfassung: fehler.length === 0
+        ? "Alle Varianten gehen durch."
+        : "Diese Varianten werden abgelehnt: " + fehler.map(f => f.variante).join(" / "),
       protokoll: protokoll,
+      bitteVonHandLoeschen: nichtGeloescht.length ? nichtGeloescht : undefined,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, msg: "Serverfehler", detail: String(e) });
